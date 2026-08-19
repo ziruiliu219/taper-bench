@@ -1,0 +1,10 @@
+# Build artifacts
+cpp/build/
+cpp/.idea/
+cpp/.vscode/
+
+# Rust build artifacts
+rust/target/
+
+# OS
+.DS_Store
