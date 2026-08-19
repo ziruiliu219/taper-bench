@@ -34,3 +34,6 @@ target_include_directories(taper_test PRIVATE include ${xxhash_SOURCE_DIR})
 
 add_executable(profile_taper_4str src/profile_taper_4str.cpp)
 target_include_directories(profile_taper_4str PRIVATE include ${xxhash_SOURCE_DIR})
+
+add_executable(verify src/verify.cpp)
+target_include_directories(verify PRIVATE include ${xxhash_SOURCE_DIR})
