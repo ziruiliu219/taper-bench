@@ -23,11 +23,17 @@ namespace taper {
 
 enum class ColumnDesc { Int64, Varchar };
 
+/// Fat pointer for a single varchar value — matches Rust's &[u8] layout (ptr + len contiguous).
+struct VarcharSlice {
+    const uint8_t* ptr;
+    size_t len;
+};
+
 struct ColumnInput {
     ColumnDesc type;
-    union { const int64_t* int64Data; struct { const uint8_t* const* ptrs; const size_t* lens; } vc; };
+    union { const int64_t* int64Data; const VarcharSlice* vcSlices; };
     static ColumnInput MakeInt64(const int64_t* d) { ColumnInput c; c.type=ColumnDesc::Int64; c.int64Data=d; return c; }
-    static ColumnInput MakeVarchar(const uint8_t* const* p, const size_t* l) { ColumnInput c; c.type=ColumnDesc::Varchar; c.vc.ptrs=p; c.vc.lens=l; return c; }
+    static ColumnInput MakeVarchar(const VarcharSlice* s) { ColumnInput c; c.type=ColumnDesc::Varchar; c.vcSlices=s; return c; }
 };
 
 // ─── Varchar helpers ─────────────────────────────────────────────────────────
@@ -209,8 +215,7 @@ private:
     /// Mirrors Rust batch_compare_varchar_decoded / batch_compare_varchar_decoded_cached.
     /// Uses mergedVarcharCache_ for multi-varchar columns (O(1) lookup via colToVarcharPos_).
     void BatchCompareVarcharDecodedNoNull(int32_t colIdx, int32_t count, int32_t offset,
-                                          const uint8_t* const* inputPtrs,
-                                          const size_t* inputLens,
+                                          const VarcharSlice* inputSlices,
                                           int32_t* indices, int32_t& idxFrom)
     {
         auto getArenaPtr = [&](int32_t idx) -> const uint8_t* {
@@ -228,7 +233,7 @@ private:
         for (int32_t i = idxFrom; i < count; i++) {
             int32_t idx = indices[i];
             const uint8_t* arenaPtr = getArenaPtr(idx);
-            if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputPtrs[idx], inputLens[idx])) {
+            if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputSlices[idx].ptr, inputSlices[idx].len)) {
                 std::swap(indices[i], indices[idxFrom]);
                 idxFrom++;
             }
@@ -277,7 +282,7 @@ private:
             } else {
                 BatchCompareVarcharDecodedNoNull(
                     colIdx, count, offset,
-                    columns[colIdx].vc.ptrs, columns[colIdx].vc.lens,
+                    columns[colIdx].vcSlices,
                     workingUpdateIndices.data(), idxFrom);
             }
         }
@@ -294,8 +299,8 @@ private:
             uint32_t rowIdx = rowIndices[i];
             size_t totalSize = 0;
             for (auto vcIdx : varcharColIndices) {
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx])
-                               + columns[vcIdx].vc.lens[rowIdx];
+                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vcSlices[rowIdx].len)
+                               + columns[vcIdx].vcSlices[rowIdx].len;
             }
             uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
             uint8_t* writePos = blockStart;
@@ -304,8 +309,8 @@ private:
                 RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
                 writePos += SerializeVarcharToBuffer(
                     writePos,
-                    columns[vcIdx].vc.ptrs[rowIdx],
-                    columns[vcIdx].vc.lens[rowIdx]);
+                    columns[vcIdx].vcSlices[rowIdx].ptr,
+                    columns[vcIdx].vcSlices[rowIdx].len);
             }
             auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
             memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
@@ -320,10 +325,10 @@ private:
             char* row = reinterpret_cast<char*>(rows[i]);
             uint32_t rowIdx = rowIndices[i];
             RowContainer::ClearNullAt(row, nullByte, nullMask);
-            size_t len = columns[colIdx].vc.lens[rowIdx];
+            size_t len = columns[colIdx].vcSlices[rowIdx].len;
             size_t totalSize = 1 + ComputeRowLenSize(len) + len;
             uint8_t* arenaPtr = aggRows->ArenaAlloc(totalSize);
-            SerializeVarcharToBuffer(arenaPtr, columns[colIdx].vc.ptrs[rowIdx], len);
+            SerializeVarcharToBuffer(arenaPtr, columns[colIdx].vcSlices[rowIdx].ptr, len);
             memcpy(row + offset, &arenaPtr, sizeof(arenaPtr));
         }
     }
@@ -346,8 +351,8 @@ private:
         if (varcharColIndices.size() > 1) {
             size_t totalSize = 0;
             for (auto vcIdx : varcharColIndices)
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vc.lens[rowIdx])
-                               + columns[vcIdx].vc.lens[rowIdx];
+                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vcSlices[rowIdx].len)
+                               + columns[vcIdx].vcSlices[rowIdx].len;
             uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
             uint8_t* writePos = blockStart;
             for (auto vcIdx : varcharColIndices) {
@@ -355,8 +360,8 @@ private:
                 RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
                 writePos += SerializeVarcharToBuffer(
                     writePos,
-                    columns[vcIdx].vc.ptrs[rowIdx],
-                    columns[vcIdx].vc.lens[rowIdx]);
+                    columns[vcIdx].vcSlices[rowIdx].ptr,
+                    columns[vcIdx].vcSlices[rowIdx].len);
             }
             auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
             memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
@@ -364,10 +369,10 @@ private:
             int32_t vcIdx = varcharColIndices[0];
             auto col = aggRows->ColumnAt(vcIdx);
             RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-            size_t len = columns[vcIdx].vc.lens[rowIdx];
+            size_t len = columns[vcIdx].vcSlices[rowIdx].len;
             size_t totalSize = 1 + ComputeRowLenSize(len) + len;
             uint8_t* arenaPtr = aggRows->ArenaAlloc(totalSize);
-            SerializeVarcharToBuffer(arenaPtr, columns[vcIdx].vc.ptrs[rowIdx], len);
+            SerializeVarcharToBuffer(arenaPtr, columns[vcIdx].vcSlices[rowIdx].ptr, len);
             memcpy(row + col.Offset(), &arenaPtr, sizeof(arenaPtr));
         }
         for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
@@ -415,8 +420,8 @@ private:
                 memcpy(&arenaPtr, row + col.Offset(), sizeof(arenaPtr));
                 if (!arenaPtr || !CompareVarcharFromRow(
                         arenaPtr,
-                        columns[colIdx].vc.ptrs[rowIdx],
-                        columns[colIdx].vc.lens[rowIdx]))
+                        columns[colIdx].vcSlices[rowIdx].ptr,
+                        columns[colIdx].vcSlices[rowIdx].len))
                     return false;
             }
         }

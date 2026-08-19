@@ -46,8 +46,8 @@ int main() {
     for(size_t c=0;c<NS;c++){all[c]=bs[c];for(auto&v:sp[c])all[c].push_back(std::move(v));}
     std::vector<int64_t> ah=bh; ah.insert(ah.end(),sh.begin(),sh.end());
     std::vector<int64_t> av=bv; av.insert(av.end(),pv.begin(),pv.end());
-    std::vector<std::vector<const uint8_t*>> aptrs(NS); std::vector<std::vector<size_t>> alens(NS);
-    for(size_t c=0;c<NS;c++){aptrs[c].resize(TR);alens[c].resize(TR);for(size_t i=0;i<TR;i++){aptrs[c][i]=all[c][i].data();alens[c][i]=all[c][i].size();}}
+    std::vector<std::vector<taper::VarcharSlice>> aslices(NS);
+    for(size_t c=0;c<NS;c++){aslices[c].resize(TR);for(size_t i=0;i<TR;i++){aslices[c][i].ptr=all[c][i].data();aslices[c][i].len=all[c][i].size();}}
 
     // ── Profile loop (200 iters for ~15-20s of sampling) ─────────────────────
     size_t lastG=0;
@@ -56,7 +56,7 @@ int main() {
         std::vector<taper::ColumnDesc> cd(NS, taper::ColumnDesc::Varchar);
         taper::TaperColumnSerializeHandler t(pool, 8, cd, HT);
         std::vector<taper::ColumnInput> cols;
-        for(size_t c=0;c<NS;c++) cols.push_back(taper::ColumnInput::MakeVarchar(aptrs[c].data(),alens[c].data()));
+        for(size_t c=0;c<NS;c++) cols.push_back(taper::ColumnInput::MakeVarchar(aslices[c].data()));
         t.EmplaceTableWithDecode(ah.data(),static_cast<int32_t>(TR),cols,av.data());
         lastG=t.NumGroups();
     }

@@ -29,10 +29,10 @@ void TestMixed() {
     taper::TaperColumnSerializeHandler t(pool, 8, cd, 64);
     std::string ss[]={"alpha","beta","gamma","alpha","beta","delta"};
     int64_t ints[]={1,2,3,1,2,4}, vals[]={10,20,30,40,50,60};
-    std::vector<const uint8_t*> sp(6); std::vector<size_t> sl(6);
-    for(int i=0;i<6;i++){sp[i]=reinterpret_cast<const uint8_t*>(ss[i].data());sl[i]=ss[i].size();}
-    int64_t h[6]; for(int i=0;i<6;i++) h[i]=HC(HB(sp[i],sl[i],0),ints[i]);
-    std::vector<taper::ColumnInput> cols={taper::ColumnInput::MakeVarchar(sp.data(),sl.data()),taper::ColumnInput::MakeInt64(ints)};
+    taper::VarcharSlice vs[6];
+    for(int i=0;i<6;i++){vs[i].ptr=reinterpret_cast<const uint8_t*>(ss[i].data());vs[i].len=ss[i].size();}
+    int64_t h[6]; for(int i=0;i<6;i++) h[i]=HC(HB(vs[i].ptr,vs[i].len,0),ints[i]);
+    std::vector<taper::ColumnInput> cols={taper::ColumnInput::MakeVarchar(vs),taper::ColumnInput::MakeInt64(ints)};
     t.EmplaceTableWithDecode(h,6,cols,vals);
     assert(t.NumGroups()==4); printf("OK (4 groups)\n");
 }
@@ -44,10 +44,10 @@ void TestMultiVarchar() {
     taper::TaperColumnSerializeHandler t(pool, 8, cd, 64);
     std::string s0[]={"foo","bar","foo","baz"}, s1[]={"X","Y","X","Z"};
     int64_t vals[]={1,2,3,4};
-    std::vector<const uint8_t*> p0(4),p1(4); std::vector<size_t> l0(4),l1(4);
-    for(int i=0;i<4;i++){p0[i]=(const uint8_t*)s0[i].data();l0[i]=s0[i].size();p1[i]=(const uint8_t*)s1[i].data();l1[i]=s1[i].size();}
-    int64_t h[4]; for(int i=0;i<4;i++) h[i]=HB(p1[i],l1[i],HB(p0[i],l0[i],0));
-    std::vector<taper::ColumnInput> cols={taper::ColumnInput::MakeVarchar(p0.data(),l0.data()),taper::ColumnInput::MakeVarchar(p1.data(),l1.data())};
+    taper::VarcharSlice vs0[4], vs1[4];
+    for(int i=0;i<4;i++){vs0[i].ptr=(const uint8_t*)s0[i].data();vs0[i].len=s0[i].size();vs1[i].ptr=(const uint8_t*)s1[i].data();vs1[i].len=s1[i].size();}
+    int64_t h[4]; for(int i=0;i<4;i++) h[i]=HB(vs1[i].ptr,vs1[i].len,HB(vs0[i].ptr,vs0[i].len,0));
+    std::vector<taper::ColumnInput> cols={taper::ColumnInput::MakeVarchar(vs0),taper::ColumnInput::MakeVarchar(vs1)};
     t.EmplaceTableWithDecode(h,4,cols,vals);
     assert(t.NumGroups()==3); printf("OK (3 groups)\n");
 }

@@ -17,8 +17,8 @@ struct BenchData {
     std::vector<std::vector<std::vector<uint8_t>>> strCols;
     std::vector<std::vector<int64_t>> intCols;
     std::vector<int64_t> hashes, values;
-    std::vector<std::vector<const uint8_t*>> strPtrs;
-    std::vector<std::vector<size_t>> strLens;
+    /// VarcharSlice arrays (ptr+len contiguous) — matches Rust &[&[u8]] layout
+    std::vector<std::vector<taper::VarcharSlice>> strSlices;
     size_t nStr,nInt,totalRows;
 };
 
@@ -46,8 +46,8 @@ BenchData GenData(size_t nStr,size_t nInt,size_t nKeys,size_t nProbe,double sel,
     for(size_t c=0;c<nInt;c++){d.intCols[c].insert(d.intCols[c].end(),pi[c].begin(),pi[c].end());}
     d.hashes=bh; d.hashes.insert(d.hashes.end(),ph.begin(),ph.end());
     d.values=bv; d.values.insert(d.values.end(),pv.begin(),pv.end());
-    d.strPtrs.resize(nStr); d.strLens.resize(nStr);
-    for(size_t c=0;c<nStr;c++){d.strPtrs[c].resize(d.totalRows);d.strLens[c].resize(d.totalRows);for(size_t i=0;i<d.totalRows;i++){d.strPtrs[c][i]=d.strCols[c][i].data();d.strLens[c][i]=d.strCols[c][i].size();}}
+    d.strSlices.resize(nStr);
+    for(size_t c=0;c<nStr;c++){d.strSlices[c].resize(d.totalRows);for(size_t i=0;i<d.totalRows;i++){d.strSlices[c][i].ptr=d.strCols[c][i].data();d.strSlices[c][i].len=d.strCols[c][i].size();}}
     return d;
 }
 
@@ -60,16 +60,18 @@ static void RunTaper(const BenchData& d, size_t numChunks) {
     size_t totalRows = d.totalRows;
     size_t numBatches = (totalRows + BATCH_SIZE - 1) / BATCH_SIZE;
 
+    // Pre-allocate cols vector outside the loop — avoid per-batch heap alloc
+    std::vector<taper::ColumnInput> cols(d.nStr + d.nInt);
+
     for (size_t batch = 0; batch < numBatches; batch++) {
         size_t start = batch * BATCH_SIZE;
         size_t end = std::min(start + BATCH_SIZE, totalRows);
         int32_t batchLen = static_cast<int32_t>(end - start);
 
-        std::vector<taper::ColumnInput> cols;
         for (size_t c = 0; c < d.nStr; c++)
-            cols.push_back(taper::ColumnInput::MakeVarchar(d.strPtrs[c].data() + start, d.strLens[c].data() + start));
+            cols[c] = taper::ColumnInput::MakeVarchar(d.strSlices[c].data() + start);
         for (size_t c = 0; c < d.nInt; c++)
-            cols.push_back(taper::ColumnInput::MakeInt64(d.intCols[c].data() + start));
+            cols[d.nStr + c] = taper::ColumnInput::MakeInt64(d.intCols[c].data() + start);
 
         t.EmplaceTableWithDecode(d.hashes.data() + start, batchLen, cols, d.values.data() + start);
     }

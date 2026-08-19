@@ -72,9 +72,9 @@ int main() {
     std::vector<int64_t> ah=bh; ah.insert(ah.end(),sh.begin(),sh.end());
     std::vector<int64_t> av=bv; av.insert(av.end(),pv.begin(),pv.end());
 
-    // pointer/len arrays for varchar
-    std::vector<const uint8_t*> aptrs(TR); std::vector<size_t> alens(TR);
-    for(size_t i=0;i<TR;i++){aptrs[i]=allstr[i].data();alens[i]=allstr[i].size();}
+    // VarcharSlice array for varchar column
+    std::vector<taper::VarcharSlice> aslices(TR);
+    for(size_t i=0;i<TR;i++){aslices[i].ptr=allstr[i].data();aslices[i].len=allstr[i].size();}
 
     // ── Profile loop ─────────────────────────────────────────────────────────
     size_t lastG=0;
@@ -87,7 +87,7 @@ int main() {
         // Use (TR+7)/8 chunks so initial capacity >= TR, avoiding any rehash/rebuild
         taper::TaperColumnSerializeHandler t(pool, 8, cd, (TR + 7) / 8);
         std::vector<taper::ColumnInput> cols;
-        cols.push_back(taper::ColumnInput::MakeVarchar(aptrs.data(), alens.data()));
+        cols.push_back(taper::ColumnInput::MakeVarchar(aslices.data()));
         for(size_t c=0;c<NI;c++) cols.push_back(taper::ColumnInput::MakeInt64(allint[c].data()));
         t.EmplaceTableWithDecode(ah.data(), static_cast<int32_t>(TR), cols, av.data());
         lastG=t.NumGroups();
