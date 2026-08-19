@@ -1,12 +1,6 @@
 /**
- * Standalone TaperColumnSerializeHandler — naming aligned with OmniOperator.
- * Target: Linux aarch64.
- *
- * Mirrors core/src/operator/hashmap/column_marshaller.h:
- *   - BatchCompareVarcharDecoded: SVE path for no-null, scalar fallback
- *   - SveBatchCompareNoNullDecoded<int64_t>: SVE gather compare for int64
- *   - colToVarcharPos_: O(1) varchar column position lookup
- *   - GetUnequalsNumWithDecode: dispatches to typed methods, zero encoding branches
+ * TaperColumnSerializeHandler — optimized to match Rust's access patterns exactly.
+ * Pre-computed column offsets (no per-row ColumnAt calls), direct RowContainer access.
  */
 #pragma once
 #include <cstdint>
@@ -14,7 +8,6 @@
 #include <cassert>
 #include <vector>
 #include <algorithm>
-#include <memory>
 #include "taper_hashtable.h"
 #include "row_container.h"
 #include "simple_arena_allocator.h"
@@ -23,7 +16,6 @@ namespace taper {
 
 enum class ColumnDesc { Int64, Varchar };
 
-/// Fat pointer for a single varchar value — matches Rust's &[u8] layout (ptr + len contiguous).
 struct VarcharSlice {
     const uint8_t* ptr;
     size_t len;
@@ -54,20 +46,16 @@ inline size_t ComputeVarCharSerializedSize(const uint8_t* data) {
     return 1+rowLenSize+stringLen;
 }
 
-/// Mirrors OmniOperator CompareVarcharFromRow:
-///   return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
 inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, size_t inputLen) {
     uint8_t rowLenSize = *rowData; if(!rowLenSize) return false;
     size_t stringLen=0;
     switch(rowLenSize){case 1:stringLen=*(rowData+1);break;case 2:{uint16_t v;memcpy(&v,rowData+1,2);stringLen=v;break;}default:{uint32_t v;memcpy(&v,rowData+1,4);stringLen=v;}}
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
-    const uint8_t* ptr = rowData+1+rowLenSize;
-    return memcmp(ptr, input, stringLen)==0;
+    return memcmp(rowData+1+rowLenSize, input, stringLen)==0;
 }
 
 // ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────
-// ROW_PTR_SIZE = 6 is defined in taper_hashtable.h
 
 static inline void SetRowPtr(char* buf, uint8_t* ptr) {
     uint64_t val = reinterpret_cast<uint64_t>(ptr);
@@ -88,105 +76,154 @@ class TaperColumnSerializeHandler {
 public:
     using HashTable = TaperFlatHashTable;
 
-    int32_t totalAggValueSize = 0;
-    int32_t totalAggStatesSize = 0;
-    std::unique_ptr<HashTable> table;
-    std::unique_ptr<RowContainer> aggRows;
-    std::vector<int64_t> workingHashVals;
-    std::vector<int32_t> workingUpdateIndices;
-    int32_t workingUpdateCount = 0;
-    std::vector<int32_t> keyTypeSizes;
-    std::vector<int32_t> varcharColIndices;
-    int32_t varcharSlotColIdx = -1;
+private:
+    HashTable table_;
+    RowContainer aggRows_;
+    std::vector<ColumnDesc> colDescs_;
+    int32_t groupColNum_ = 0;
+    int32_t aggOffset_ = 0;
+
+    // Pre-computed column layout (matches Rust col_offsets, varchar_col_indices, etc.)
+    std::vector<int32_t> colOffsets_;       // colOffsets_[i] = RowColumn.Offset() for col i
+    std::vector<uint32_t> colNullBytes_;    // null byte offset for col i
+    std::vector<uint8_t> colNullMasks_;     // null mask for col i
+    std::vector<int32_t> varcharColIndices_;
+    int32_t varcharSlotColIdx_ = -1;
+    int32_t varcharSlotOffset_ = 0;
+    bool useMerged_ = false;
+    std::vector<int32_t> colToVarcharPos_;
+
+    // Reusable buffers
+    std::vector<int32_t> workingUpdateIndices_;
+    int32_t workingUpdateCount_ = 0;
     std::vector<const uint8_t*> mergedVarcharCache_;
     int32_t mergedVarcharCacheCount_ = 0;
-    /// Mirrors OmniOperator colToVarcharPos_: O(1) map from column index → position in varcharColIndices.
-    std::vector<int32_t> colToVarcharPos_;
-    std::vector<uint8_t*> groups;
+    std::vector<uint8_t*> groups_;
 
+public:
     TaperColumnSerializeHandler(SimpleArenaAllocator& pool, int32_t aggStatesSize,
                                 const std::vector<ColumnDesc>& colDescs, size_t initCap)
-        : totalAggStatesSize(aggStatesSize), colDescs_(colDescs)
+        : table_(initCap), aggRows_(BuildRowContainer(colDescs, aggStatesSize, pool)),
+          colDescs_(colDescs), groupColNum_(static_cast<int32_t>(colDescs.size()))
     {
-        totalAggValueSize = aggStatesSize + static_cast<int32_t>(sizeof(size_t));
-        table = std::make_unique<HashTable>(initCap);
+        aggOffset_ = aggRows_.AggStateOffset();
 
-        std::vector<size_t> keySizes;
-        std::vector<ColumnKind> kinds;
-        for (size_t i = 0; i < colDescs.size(); i++) {
-            if (colDescs[i] == ColumnDesc::Int64) {
-                keySizes.push_back(8); kinds.push_back(ColumnKind::Fixed);
-                keyTypeSizes.push_back(8);
-            } else {
-                keySizes.push_back(0); kinds.push_back(ColumnKind::Varchar);
-                keyTypeSizes.push_back(0);
-                varcharColIndices.push_back(static_cast<int32_t>(i));
-            }
+        // Pre-compute column offsets and null info
+        colOffsets_.resize(groupColNum_);
+        colNullBytes_.resize(groupColNum_);
+        colNullMasks_.resize(groupColNum_);
+        for (int32_t i = 0; i < groupColNum_; i++) {
+            auto col = aggRows_.ColumnAt(i);
+            colOffsets_[i] = col.Offset();
+            colNullBytes_[i] = col.NullByte();
+            colNullMasks_[i] = col.NullMask();
         }
-        if (varcharColIndices.size() > 1) {
-            varcharSlotColIdx = varcharColIndices[0];
+
+        // Varchar index setup
+        for (int32_t i = 0; i < groupColNum_; i++) {
+            if (colDescs[i] == ColumnDesc::Varchar)
+                varcharColIndices_.push_back(i);
         }
-        // Build colToVarcharPos_ — mirrors OmniOperator colToVarcharPos_.assign(groupColNum, -1)
-        colToVarcharPos_.assign(static_cast<int32_t>(colDescs.size()), -1);
-        for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices.size()); ++v) {
-            colToVarcharPos_[varcharColIndices[v]] = v;
+        useMerged_ = varcharColIndices_.size() > 1;
+        if (!varcharColIndices_.empty()) {
+            varcharSlotColIdx_ = varcharColIndices_[0];
+            varcharSlotOffset_ = colOffsets_[varcharSlotColIdx_];
         }
-        aggRows = std::make_unique<RowContainer>(keySizes, kinds, aggStatesSize, pool);
+        colToVarcharPos_.assign(groupColNum_, -1);
+        for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices_.size()); ++v)
+            colToVarcharPos_[varcharColIndices_[v]] = v;
     }
 
-    int32_t AggStateOffset() const { return aggRows->AggStateOffset(); }
-    size_t NumGroups() const { return aggRows->NumRows(); }
+    int32_t AggStateOffset() const { return aggOffset_; }
+    size_t NumGroups() const { return aggRows_.NumRows(); }
 
     void EmplaceTableWithDecode(const int64_t* hashes, int32_t rowsNum,
         const std::vector<ColumnInput>& columns, const int64_t* aggValues)
     {
         if (rowsNum <= 0) return;
 
-        int32_t groupColNum = static_cast<int32_t>(colDescs_.size());
-        int32_t aggOffset = AggStateOffset();
+        groups_.resize(rowsNum);
+        workingUpdateIndices_.resize(rowsNum);
+        workingUpdateCount_ = 0;
 
-        groups.resize(rowsNum, nullptr);
+        // Local copies for lambda capture (avoid 'this' indirection)
+        RowContainer* rc = &aggRows_;
+        const int32_t aggOffset = aggOffset_;
+        const auto* colOffsets = colOffsets_.data();
+        const auto* colNullBytes = colNullBytes_.data();
+        const auto* colNullMasks = colNullMasks_.data();
+        const auto* vcIndices = varcharColIndices_.data();
+        const int32_t vcCount = static_cast<int32_t>(varcharColIndices_.size());
+        const int32_t vcSlotOffset = varcharSlotOffset_;
+        const bool merged = useMerged_;
+        const ColumnInput* colsPtr = columns.data();
+        const int32_t gcn = groupColNum_;
 
-        workingUpdateIndices.resize(rowsNum);
-        workingUpdateCount = 0;
-
-        // Step 2: EmplaceBatch — store keys immediately in init (matches Rust on_init)
-        table->EmplaceBatch(hashes, rowsNum,
+        // Step 2: EmplaceBatch
+        table_.EmplaceBatch(hashes, rowsNum,
             [](int32_t) { return false; },
             [&](uint32_t rowIdx, char* data) {
-                auto* row = aggRows->NewRow();
+                char* row = rc->NewRow();
                 SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
-                StoreKeyOneRowFromDecode(row, rowIdx, columns, groupColNum);
+                // Inline StoreKeyOneRowFromDecode — no virtual/indirect calls
+                if (merged) {
+                    size_t totalSize = 0;
+                    for (int32_t v = 0; v < vcCount; v++) {
+                        int32_t ci = vcIndices[v];
+                        totalSize += 1 + ComputeRowLenSize(colsPtr[ci].vcSlices[rowIdx].len)
+                                       + colsPtr[ci].vcSlices[rowIdx].len;
+                    }
+                    uint8_t* blockStart = rc->ArenaAlloc(totalSize);
+                    uint8_t* wp = blockStart;
+                    for (int32_t v = 0; v < vcCount; v++) {
+                        int32_t ci = vcIndices[v];
+                        RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
+                        wp += SerializeVarcharToBuffer(wp, colsPtr[ci].vcSlices[rowIdx].ptr, colsPtr[ci].vcSlices[rowIdx].len);
+                    }
+                    memcpy(row + vcSlotOffset, &blockStart, sizeof(blockStart));
+                } else if (vcCount == 1) {
+                    int32_t ci = vcIndices[0];
+                    RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
+                    size_t len = colsPtr[ci].vcSlices[rowIdx].len;
+                    size_t ts = 1 + ComputeRowLenSize(len) + len;
+                    uint8_t* ap = rc->ArenaAlloc(ts);
+                    SerializeVarcharToBuffer(ap, colsPtr[ci].vcSlices[rowIdx].ptr, len);
+                    memcpy(row + colOffsets[ci], &ap, sizeof(ap));
+                }
+                for (int32_t ci = 0; ci < gcn; ci++) {
+                    if (colsPtr[ci].type == ColumnDesc::Int64) {
+                        RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
+                        RowContainer::StoreValue<int64_t>(row, colOffsets[ci], colsPtr[ci].int64Data[rowIdx]);
+                    }
+                }
                 RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
             },
             [&](uint32_t rowIdx, char* data, bool initFlag) {
-                groups[rowIdx] = GetRowPtr(data);
+                groups_[rowIdx] = GetRowPtr(data);
                 if (!initFlag) {
-                    workingUpdateIndices[workingUpdateCount++] = rowIdx;
+                    workingUpdateIndices_[workingUpdateCount_++] = rowIdx;
                 }
             }
         );
 
-        if (workingUpdateCount == 0) return;
+        if (workingUpdateCount_ == 0) return;
 
         // Step 4: GetUnequalsNumWithDecode
-        int32_t count = workingUpdateCount;
-        int32_t unequalsNum = GetUnequalsNumWithDecode(count, groupColNum, columns);
+        int32_t count = workingUpdateCount_;
+        int32_t unequalsNum = GetUnequalsNumWithDecode(count, columns);
 
         // Step 5: re-emplace collisions
         for (int32_t ui = 0; ui < unequalsNum; ui++) {
-            int32_t rowIdx = workingUpdateIndices[ui];
+            int32_t rowIdx = workingUpdateIndices_[ui];
             int64_t hash = hashes[rowIdx];
-            table->Emplace(hash,
+            table_.Emplace(hash,
                 [&](const char* valBuf) -> bool {
-                    return CompareKeysWithDecode(
-                        reinterpret_cast<const char*>(GetRowPtr(valBuf)),
-                        rowIdx, columns, groupColNum);
+                    return CompareKeysWithDecode(GetRowPtr(valBuf), rowIdx, columns);
                 },
                 [&](char* data) {
-                    auto* row = aggRows->NewRow();
+                    char* row = rc->NewRow();
                     SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
-                    StoreKeyOneRowFromDecode(row, rowIdx, columns, groupColNum);
+                    StoreKeyOneRow(row, rowIdx, colsPtr);
                     RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
                 },
                 [&](char* data, bool isNew) {
@@ -194,45 +231,113 @@ public:
                         auto* rp = GetRowPtr(data);
                         *reinterpret_cast<int64_t*>(rp + aggOffset) += aggValues[rowIdx];
                     }
-                    groups[rowIdx] = GetRowPtr(data);
+                    groups_[rowIdx] = GetRowPtr(data);
                 }
             );
         }
 
         // Accumulate agg for confirmed-equal rows
         for (int32_t ui = unequalsNum; ui < count; ui++) {
-            int32_t rowIdx = workingUpdateIndices[ui];
-            auto* rp = groups[rowIdx];
-            *reinterpret_cast<int64_t*>(rp + aggOffset) += aggValues[rowIdx];
+            int32_t rowIdx = workingUpdateIndices_[ui];
+            auto* rp = groups_[rowIdx];
+            *reinterpret_cast<int64_t*>(rp + aggOffset_) += aggValues[rowIdx];
         }
     }
 
 private:
-    std::vector<ColumnDesc> colDescs_;
+    static RowContainer BuildRowContainer(const std::vector<ColumnDesc>& colDescs, int32_t aggStatesSize, SimpleArenaAllocator& pool) {
+        std::vector<size_t> keySizes;
+        std::vector<ColumnKind> kinds;
+        for (auto& cd : colDescs) {
+            if (cd == ColumnDesc::Int64) { keySizes.push_back(8); kinds.push_back(ColumnKind::Fixed); }
+            else { keySizes.push_back(0); kinds.push_back(ColumnKind::Varchar); }
+        }
+        return RowContainer(keySizes, kinds, aggStatesSize, pool);
+    }
 
-    // ─── BatchCompareVarcharDecoded (scalar, matches Rust) ───────────────────
+    // ─── Hot path: store keys for one row (inlined in lambda, also used by Step 5) ───
 
-    /// Mirrors Rust batch_compare_varchar_decoded / batch_compare_varchar_decoded_cached.
-    /// Uses mergedVarcharCache_ for multi-varchar columns (O(1) lookup via colToVarcharPos_).
-    void BatchCompareVarcharDecodedNoNull(int32_t colIdx, int32_t count, int32_t offset,
-                                          const VarcharSlice* inputSlices,
-                                          int32_t* indices, int32_t& idxFrom)
-    {
-        auto getArenaPtr = [&](int32_t idx) -> const uint8_t* {
-            if (!mergedVarcharCache_.empty()) {
-                int32_t vcPos = colToVarcharPos_[colIdx];
-                return mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_ + vcPos];
+    void StoreKeyOneRow(char* row, int32_t rowIdx, const ColumnInput* cols) {
+        if (useMerged_) {
+            size_t totalSize = 0;
+            for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices_.size()); v++) {
+                int32_t ci = varcharColIndices_[v];
+                totalSize += 1 + ComputeRowLenSize(cols[ci].vcSlices[rowIdx].len) + cols[ci].vcSlices[rowIdx].len;
             }
-            const uint8_t* arenaPtr;
-            memcpy(&arenaPtr,
-                   reinterpret_cast<const char*>(groups[idx]) + offset,
-                   sizeof(arenaPtr));
-            return arenaPtr;
-        };
+            uint8_t* blockStart = aggRows_.ArenaAlloc(totalSize);
+            uint8_t* wp = blockStart;
+            for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices_.size()); v++) {
+                int32_t ci = varcharColIndices_[v];
+                RowContainer::ClearNullAt(row, colNullBytes_[ci], colNullMasks_[ci]);
+                wp += SerializeVarcharToBuffer(wp, cols[ci].vcSlices[rowIdx].ptr, cols[ci].vcSlices[rowIdx].len);
+            }
+            memcpy(row + varcharSlotOffset_, &blockStart, sizeof(blockStart));
+        } else if (!varcharColIndices_.empty()) {
+            int32_t ci = varcharColIndices_[0];
+            RowContainer::ClearNullAt(row, colNullBytes_[ci], colNullMasks_[ci]);
+            size_t len = cols[ci].vcSlices[rowIdx].len;
+            uint8_t* ap = aggRows_.ArenaAlloc(1 + ComputeRowLenSize(len) + len);
+            SerializeVarcharToBuffer(ap, cols[ci].vcSlices[rowIdx].ptr, len);
+            memcpy(row + colOffsets_[ci], &ap, sizeof(ap));
+        }
+        for (int32_t ci = 0; ci < groupColNum_; ci++) {
+            if (colDescs_[ci] == ColumnDesc::Int64) {
+                RowContainer::ClearNullAt(row, colNullBytes_[ci], colNullMasks_[ci]);
+                RowContainer::StoreValue<int64_t>(row, colOffsets_[ci], cols[ci].int64Data[rowIdx]);
+            }
+        }
+    }
 
+    // ─── GetUnequalsNumWithDecode ────────────────────────────────────────────
+
+    int32_t GetUnequalsNumWithDecode(int32_t count, const std::vector<ColumnInput>& columns) {
+        mergedVarcharCache_.clear();
+        mergedVarcharCacheCount_ = 0;
+        if (useMerged_) {
+            mergedVarcharCacheCount_ = static_cast<int32_t>(varcharColIndices_.size());
+            int32_t maxIdx = 0;
+            for (int32_t w = 0; w < count; w++)
+                maxIdx = std::max(maxIdx, workingUpdateIndices_[w]);
+            mergedVarcharCache_.resize(static_cast<size_t>(maxIdx + 1) * mergedVarcharCacheCount_, nullptr);
+            for (int32_t w = 0; w < count; w++) {
+                int32_t idx = workingUpdateIndices_[w];
+                GetAllMergedVarcharPtrs(
+                    reinterpret_cast<const char*>(groups_[idx]),
+                    &mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_],
+                    mergedVarcharCacheCount_);
+            }
+        }
+
+        int32_t idxFrom = 0;
+        for (int32_t colIdx = 0; colIdx < groupColNum_ && idxFrom < count; colIdx++) {
+            int32_t offset = colOffsets_[colIdx];
+            if (colDescs_[colIdx] == ColumnDesc::Int64) {
+                const int64_t* inputValues = columns[colIdx].int64Data;
+                for (int32_t i = idxFrom; i < count; i++) {
+                    int32_t idx = workingUpdateIndices_[i];
+                    if (RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups_[idx]), offset) != inputValues[idx]) {
+                        std::swap(workingUpdateIndices_[i], workingUpdateIndices_[idxFrom]); idxFrom++;
+                    }
+                }
+            } else {
+                BatchCompareVarcharDecodedNoNull(colIdx, count, offset, columns[colIdx].vcSlices, workingUpdateIndices_.data(), idxFrom);
+            }
+        }
+        return idxFrom;
+    }
+
+    void BatchCompareVarcharDecodedNoNull(int32_t colIdx, int32_t count, int32_t offset,
+                                          const VarcharSlice* inputSlices, int32_t* indices, int32_t& idxFrom)
+    {
+        const int32_t vcPos = colToVarcharPos_[colIdx];
         for (int32_t i = idxFrom; i < count; i++) {
             int32_t idx = indices[i];
-            const uint8_t* arenaPtr = getArenaPtr(idx);
+            const uint8_t* arenaPtr;
+            if (!mergedVarcharCache_.empty()) {
+                arenaPtr = mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_ + vcPos];
+            } else {
+                memcpy(&arenaPtr, reinterpret_cast<const char*>(groups_[idx]) + offset, sizeof(arenaPtr));
+            }
             if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputSlices[idx].ptr, inputSlices[idx].len)) {
                 std::swap(indices[i], indices[idxFrom]);
                 idxFrom++;
@@ -240,163 +345,14 @@ private:
         }
     }
 
-    // ─── GetUnequalsNumWithDecode (scalar only, matches Rust) ────────────────
-
-    int32_t GetUnequalsNumWithDecode(int32_t count, int32_t groupColNum,
-                                     const std::vector<ColumnInput>& columns)
-    {
-        // Build merged varchar cache
-        mergedVarcharCache_.clear();
-        mergedVarcharCacheCount_ = 0;
-        if (varcharColIndices.size() > 1) {
-            mergedVarcharCacheCount_ = static_cast<int32_t>(varcharColIndices.size());
-            int32_t maxIdx = 0;
-            for (int32_t w = 0; w < count; w++)
-                maxIdx = std::max(maxIdx, workingUpdateIndices[w]);
-            mergedVarcharCache_.resize(
-                static_cast<size_t>(maxIdx + 1) * mergedVarcharCacheCount_, nullptr);
-            for (int32_t w = 0; w < count; w++) {
-                int32_t idx = workingUpdateIndices[w];
-                GetAllMergedVarcharPtrs(
-                    reinterpret_cast<const char*>(groups[idx]),
-                    &mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_],
-                    mergedVarcharCacheCount_);
-            }
-        }
-
-        int32_t idxFrom = 0;
-        for (int32_t colIdx = 0; colIdx < groupColNum && idxFrom < count; colIdx++) {
-            auto col = aggRows->ColumnAt(colIdx);
-            int32_t offset = col.Offset();
-
-            if (colDescs_[colIdx] == ColumnDesc::Int64) {
-                const int64_t* inputValues = columns[colIdx].int64Data;
-                // Scalar only — matches Rust batch_compare_decoded_i64_scalar
-                for (int32_t i = idxFrom; i < count; i++) {
-                    int32_t idx = workingUpdateIndices[i];
-                    if (RowContainer::ReadValue<int64_t>(
-                            reinterpret_cast<const char*>(groups[idx]), offset) != inputValues[idx]) {
-                        std::swap(workingUpdateIndices[i], workingUpdateIndices[idxFrom]); idxFrom++;
-                    }
-                }
-            } else {
-                BatchCompareVarcharDecodedNoNull(
-                    colIdx, count, offset,
-                    columns[colIdx].vcSlices,
-                    workingUpdateIndices.data(), idxFrom);
-            }
-        }
-        return idxFrom;
-    }
-
-    // ─── Key store helpers ───────────────────────────────────────────────────
-
-    void BatchStoreMergedVarcharColumns(const std::vector<ColumnInput>& columns,
-                                        uint8_t** rows, uint32_t* rowIndices, int32_t rowCount)
-    {
-        for (int32_t i = 0; i < rowCount; i++) {
-            char* row = reinterpret_cast<char*>(rows[i]);
-            uint32_t rowIdx = rowIndices[i];
-            size_t totalSize = 0;
-            for (auto vcIdx : varcharColIndices) {
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vcSlices[rowIdx].len)
-                               + columns[vcIdx].vcSlices[rowIdx].len;
-            }
-            uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
-            uint8_t* writePos = blockStart;
-            for (auto vcIdx : varcharColIndices) {
-                auto col = aggRows->ColumnAt(vcIdx);
-                RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-                writePos += SerializeVarcharToBuffer(
-                    writePos,
-                    columns[vcIdx].vcSlices[rowIdx].ptr,
-                    columns[vcIdx].vcSlices[rowIdx].len);
-            }
-            auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
-            memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
-        }
-    }
-
-    void BatchStoreKeyColumnVarcharTyped(int32_t colIdx, int32_t offset, uint32_t nullByte, uint8_t nullMask,
-                                         uint8_t** rows, uint32_t* rowIndices, int32_t rowCount,
-                                         const std::vector<ColumnInput>& columns)
-    {
-        for (int32_t i = 0; i < rowCount; i++) {
-            char* row = reinterpret_cast<char*>(rows[i]);
-            uint32_t rowIdx = rowIndices[i];
-            RowContainer::ClearNullAt(row, nullByte, nullMask);
-            size_t len = columns[colIdx].vcSlices[rowIdx].len;
-            size_t totalSize = 1 + ComputeRowLenSize(len) + len;
-            uint8_t* arenaPtr = aggRows->ArenaAlloc(totalSize);
-            SerializeVarcharToBuffer(arenaPtr, columns[colIdx].vcSlices[rowIdx].ptr, len);
-            memcpy(row + offset, &arenaPtr, sizeof(arenaPtr));
-        }
-    }
-
-    void BatchStoreKeyColumnTyped(int32_t colIdx, int32_t offset, uint32_t nullByte, uint8_t nullMask,
-                                  uint8_t** rows, uint32_t* rowIndices, int32_t rowCount,
-                                  const std::vector<ColumnInput>& columns)
-    {
-        for (int32_t i = 0; i < rowCount; i++) {
-            char* row = reinterpret_cast<char*>(rows[i]);
-            uint32_t rowIdx = rowIndices[i];
-            RowContainer::ClearNullAt(row, nullByte, nullMask);
-            RowContainer::StoreValue<int64_t>(row, offset, columns[colIdx].int64Data[rowIdx]);
-        }
-    }
-
-    void StoreKeyOneRowFromDecode(char* row, int32_t rowIdx,
-        const std::vector<ColumnInput>& columns, int32_t groupColNum)
-    {
-        if (varcharColIndices.size() > 1) {
-            size_t totalSize = 0;
-            for (auto vcIdx : varcharColIndices)
-                totalSize += 1 + ComputeRowLenSize(columns[vcIdx].vcSlices[rowIdx].len)
-                               + columns[vcIdx].vcSlices[rowIdx].len;
-            uint8_t* blockStart = aggRows->ArenaAlloc(totalSize);
-            uint8_t* writePos = blockStart;
-            for (auto vcIdx : varcharColIndices) {
-                auto col = aggRows->ColumnAt(vcIdx);
-                RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-                writePos += SerializeVarcharToBuffer(
-                    writePos,
-                    columns[vcIdx].vcSlices[rowIdx].ptr,
-                    columns[vcIdx].vcSlices[rowIdx].len);
-            }
-            auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
-            memcpy(row + slotCol.Offset(), &blockStart, sizeof(blockStart));
-        } else if (varcharColIndices.size() == 1) {
-            int32_t vcIdx = varcharColIndices[0];
-            auto col = aggRows->ColumnAt(vcIdx);
-            RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-            size_t len = columns[vcIdx].vcSlices[rowIdx].len;
-            size_t totalSize = 1 + ComputeRowLenSize(len) + len;
-            uint8_t* arenaPtr = aggRows->ArenaAlloc(totalSize);
-            SerializeVarcharToBuffer(arenaPtr, columns[vcIdx].vcSlices[rowIdx].ptr, len);
-            memcpy(row + col.Offset(), &arenaPtr, sizeof(arenaPtr));
-        }
-        for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
-            if (colDescs_[colIdx] == ColumnDesc::Int64) {
-                auto col = aggRows->ColumnAt(colIdx);
-                RowContainer::ClearNullAt(row, col.NullByte(), col.NullMask());
-                RowContainer::StoreValue<int64_t>(row, col.Offset(), columns[colIdx].int64Data[rowIdx]);
-            }
-        }
-    }
-
-    // ─── Merged varchar pointer helpers ─────────────────────────────────────
-
-    /// Mirrors OmniOperator GetAllMergedVarcharPtrs.
     void GetAllMergedVarcharPtrs(const char* row, const uint8_t** outPtrs, int32_t maxCount) const {
-        auto slotCol = aggRows->ColumnAt(varcharSlotColIdx);
         const uint8_t* blockPtr;
-        memcpy(&blockPtr, row + slotCol.Offset(), sizeof(blockPtr));
+        memcpy(&blockPtr, row + varcharSlotOffset_, sizeof(blockPtr));
         if (!blockPtr) { memset(outPtrs, 0, maxCount * sizeof(uint8_t*)); return; }
         const uint8_t* pos = blockPtr;
         for (int32_t i = 0; i < maxCount; i++) {
-            auto vcIdx = varcharColIndices[i];
-            auto col = aggRows->ColumnAt(vcIdx);
-            if (RowContainer::IsNullAt(row, col.NullByte(), col.NullMask())) {
+            int32_t ci = varcharColIndices_[i];
+            if (RowContainer::IsNullAt(row, colNullBytes_[ci], colNullMasks_[ci])) {
                 outPtrs[i] = nullptr; pos += 1;
             } else {
                 outPtrs[i] = pos; pos += ComputeVarCharSerializedSize(pos);
@@ -404,24 +360,18 @@ private:
         }
     }
 
-    // ─── Single-row key compare (step 5 scalar fallback) ────────────────────
-
-    bool CompareKeysWithDecode(const char* row, int32_t rowIdx,
-        const std::vector<ColumnInput>& columns, int32_t groupColNum) const
+    bool CompareKeysWithDecode(const uint8_t* rowPtr, int32_t rowIdx,
+        const std::vector<ColumnInput>& columns) const
     {
-        for (int32_t colIdx = 0; colIdx < groupColNum; colIdx++) {
-            auto col = aggRows->ColumnAt(colIdx);
+        const char* row = reinterpret_cast<const char*>(rowPtr);
+        for (int32_t colIdx = 0; colIdx < groupColNum_; colIdx++) {
             if (colDescs_[colIdx] == ColumnDesc::Int64) {
-                if (RowContainer::ReadValue<int64_t>(row, col.Offset())
-                        != columns[colIdx].int64Data[rowIdx])
+                if (RowContainer::ReadValue<int64_t>(row, colOffsets_[colIdx]) != columns[colIdx].int64Data[rowIdx])
                     return false;
             } else {
                 const uint8_t* arenaPtr;
-                memcpy(&arenaPtr, row + col.Offset(), sizeof(arenaPtr));
-                if (!arenaPtr || !CompareVarcharFromRow(
-                        arenaPtr,
-                        columns[colIdx].vcSlices[rowIdx].ptr,
-                        columns[colIdx].vcSlices[rowIdx].len))
+                memcpy(&arenaPtr, row + colOffsets_[colIdx], sizeof(arenaPtr));
+                if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, columns[colIdx].vcSlices[rowIdx].ptr, columns[colIdx].vcSlices[rowIdx].len))
                     return false;
             }
         }
