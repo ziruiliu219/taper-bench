@@ -37,12 +37,9 @@ public:
         if (availBytes_ < static_cast<uint64_t>(sizeInBytes)) {
             AllocateChunk(GetNextSize(static_cast<uint64_t>(sizeInBytes)));
         }
-        continuousUsedMemoryBytes_ = sizeInBytes;
         uint8_t* ret = availBuf_;
         availBuf_ += sizeInBytes;
         availBytes_ -= sizeInBytes;
-        usedBytes_ += sizeInBytes;
-        continuousUsed_ = false;
         return ret;
     }
 
