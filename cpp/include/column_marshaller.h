@@ -99,8 +99,6 @@ private:
     std::vector<const uint8_t*> mergedVarcharCache_;
     int32_t mergedVarcharCacheCount_ = 0;
     std::vector<uint8_t*> groups_;
-    std::vector<uint8_t*> newGroupRows_;
-    std::vector<uint32_t> newGroupRowIndices_;
 
 public:
     TaperColumnSerializeHandler(SimpleArenaAllocator& pool, int32_t aggStatesSize,
@@ -148,22 +146,18 @@ public:
         workingUpdateIndices_.resize(rowsNum);
         workingUpdateCount_ = 0;
 
-        // Collect new group info
-        newGroupRows_.resize(rowsNum);
-        newGroupRowIndices_.resize(rowsNum);
-        int32_t newGroupCount = 0;
-
         RowContainer* rc = &aggRows_;
+        const int32_t aggOffset = aggOffset_;
+        const ColumnInput* colsPtr = columns.data();
 
-        // Step 2: EmplaceBatch — lightweight init (just alloc row + set ptr)
+        // Step 2: EmplaceBatch — init stores keys immediately (matches Rust on_init)
         table_.EmplaceBatch(hashes, rowsNum,
             [](int32_t) { return false; },
             [&](uint32_t rowIdx, char* data) {
                 char* row = rc->NewRow();
                 SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
-                newGroupRows_[newGroupCount] = reinterpret_cast<uint8_t*>(row);
-                newGroupRowIndices_[newGroupCount] = rowIdx;
-                newGroupCount++;
+                StoreKeyOneRow(row, rowIdx, colsPtr);
+                RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
             },
             [&](uint32_t rowIdx, char* data, bool initFlag) {
                 groups_[rowIdx] = GetRowPtr(data);
@@ -173,57 +167,6 @@ public:
             }
         );
 
-        // Step 3: Batch store keys for new groups (separate from EmplaceBatch loop)
-        if (newGroupCount > 0) {
-            const ColumnInput* colsPtr = columns.data();
-            const int32_t aggOffset = aggOffset_;
-            const auto* colOffsets = colOffsets_.data();
-            const auto* colNullBytes = colNullBytes_.data();
-            const auto* colNullMasks = colNullMasks_.data();
-            const auto* vcIndices = varcharColIndices_.data();
-            const int32_t vcCount = static_cast<int32_t>(varcharColIndices_.size());
-            const int32_t vcSlotOffset = varcharSlotOffset_;
-            const int32_t gcn = groupColNum_;
-
-            for (int32_t g = 0; g < newGroupCount; g++) {
-                char* row = reinterpret_cast<char*>(newGroupRows_[g]);
-                uint32_t rowIdx = newGroupRowIndices_[g];
-
-                // Store varchar keys
-                if (useMerged_) {
-                    size_t totalSize = 0;
-                    for (int32_t v = 0; v < vcCount; v++) {
-                        int32_t ci = vcIndices[v];
-                        totalSize += 1 + ComputeRowLenSize(colsPtr[ci].vcSlices[rowIdx].len) + colsPtr[ci].vcSlices[rowIdx].len;
-                    }
-                    uint8_t* blockStart = rc->ArenaAlloc(totalSize);
-                    uint8_t* wp = blockStart;
-                    for (int32_t v = 0; v < vcCount; v++) {
-                        int32_t ci = vcIndices[v];
-                        RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
-                        wp += SerializeVarcharToBuffer(wp, colsPtr[ci].vcSlices[rowIdx].ptr, colsPtr[ci].vcSlices[rowIdx].len);
-                    }
-                    memcpy(row + vcSlotOffset, &blockStart, sizeof(blockStart));
-                } else if (vcCount == 1) {
-                    int32_t ci = vcIndices[0];
-                    RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
-                    size_t len = colsPtr[ci].vcSlices[rowIdx].len;
-                    uint8_t* ap = rc->ArenaAlloc(1 + ComputeRowLenSize(len) + len);
-                    SerializeVarcharToBuffer(ap, colsPtr[ci].vcSlices[rowIdx].ptr, len);
-                    memcpy(row + colOffsets[ci], &ap, sizeof(ap));
-                }
-                // Store int keys
-                for (int32_t ci = 0; ci < gcn; ci++) {
-                    if (colDescs_[ci] == ColumnDesc::Int64) {
-                        RowContainer::ClearNullAt(row, colNullBytes[ci], colNullMasks[ci]);
-                        RowContainer::StoreValue<int64_t>(row, colOffsets[ci], colsPtr[ci].int64Data[rowIdx]);
-                    }
-                }
-                // Store agg value
-                RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
-            }
-        }
-
         if (workingUpdateCount_ == 0) return;
 
         // Step 4: GetUnequalsNumWithDecode
@@ -231,7 +174,6 @@ public:
         int32_t unequalsNum = GetUnequalsNumWithDecode(count, columns);
 
         // Step 5: re-emplace collisions
-        const int32_t aggOffset = aggOffset_;
         for (int32_t ui = 0; ui < unequalsNum; ui++) {
             int32_t rowIdx = workingUpdateIndices_[ui];
             int64_t hash = hashes[rowIdx];
@@ -242,7 +184,7 @@ public:
                 [&](char* data) {
                     char* row = aggRows_.NewRow();
                     SetRowPtr(data, reinterpret_cast<uint8_t*>(row));
-                    StoreKeyOneRow(row, rowIdx, columns.data());
+                    StoreKeyOneRow(row, rowIdx, colsPtr);
                     RowContainer::StoreValue<int64_t>(row, aggOffset, aggValues[rowIdx]);
                 },
                 [&](char* data, bool isNew) {
@@ -274,8 +216,9 @@ private:
         return RowContainer(keySizes, kinds, aggStatesSize, pool);
     }
 
-    // ─── Hot path: store keys for one row (inlined in lambda, also used by Step 5) ───
+    // ─── Hot path: store keys for one row ───
 
+    __attribute__((noinline))
     void StoreKeyOneRow(char* row, int32_t rowIdx, const ColumnInput* cols) {
         if (useMerged_) {
             size_t totalSize = 0;
