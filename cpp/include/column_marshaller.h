@@ -218,7 +218,6 @@ private:
 
     // ─── Hot path: store keys for one row ───
 
-    __attribute__((noinline))
     void StoreKeyOneRow(char* row, int32_t rowIdx, const ColumnInput* cols) {
         if (useMerged_) {
             size_t totalSize = 0;
