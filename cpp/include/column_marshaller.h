@@ -44,8 +44,28 @@ inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, s
     case 2: { uint16_t v = static_cast<uint16_t>(len); __builtin_memcpy(writePos+1, &v, 2); break; }
     case 4: { uint32_t v = static_cast<uint32_t>(len); __builtin_memcpy(writePos+1, &v, 4); break; }
     }
-    // Copy string data — use __builtin_memcpy so compiler can inline for small sizes
-    if (len) __builtin_memcpy(writePos+1+rowLenSize, data, len);
+    // Copy string data — inline for short strings (avoids libc __memcpy_generic)
+    if (__builtin_expect(len <= 32, 1)) {
+        // Short string fast path: unrolled copy via two 16-byte loads/stores
+        // Handles 1-32 bytes without libc call
+        uint8_t* dst = writePos + 1 + rowLenSize;
+        if (len >= 16) {
+            __builtin_memcpy(dst, data, 16);
+            __builtin_memcpy(dst + len - 16, data + len - 16, 16);
+        } else if (len >= 8) {
+            __builtin_memcpy(dst, data, 8);
+            __builtin_memcpy(dst + len - 8, data + len - 8, 8);
+        } else if (len >= 4) {
+            __builtin_memcpy(dst, data, 4);
+            __builtin_memcpy(dst + len - 4, data + len - 4, 4);
+        } else if (len > 0) {
+            dst[0] = data[0];
+            if (len > 1) dst[1] = data[1];
+            if (len > 2) dst[2] = data[2];
+        }
+    } else {
+        __builtin_memcpy(writePos + 1 + rowLenSize, data, len);
+    }
     return 1+rowLenSize+len;
 }
 
