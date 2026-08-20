@@ -253,7 +253,11 @@ private:
     void AllocChunks(uint32_t lastChunkIdx) {
         auto cap = static_cast<size_t>(lastChunkIdx) + 1;
         size_t bytes = cap * sizeof(Chunk);
-        chunks_ = static_cast<Chunk*>(aligned_alloc(128, bytes));
+        // Use posix_memalign (same as Rust) — stays on heap, free doesn't munmap.
+        // aligned_alloc on glibc uses mmap for large+aligned allocations → munmap on free → page faults.
+        void* ptr = nullptr;
+        posix_memalign(&ptr, 128, bytes);
+        chunks_ = static_cast<Chunk*>(ptr);
         memset(chunks_, kEmptyTag, bytes);
         lastChunkIdx_ = lastChunkIdx; size_ = 0;
         expandThreshold_ = static_cast<uint32_t>(cap * kSlotsPerChunk * 9 / 10);
