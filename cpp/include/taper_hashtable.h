@@ -98,6 +98,8 @@ public:
 
     size_t Size() const { return size_; }
     size_t Capacity() const { return (static_cast<size_t>(lastChunkIdx_) + 1) * kSlotsPerChunk; }
+    uint32_t LastChunkIdx() const { return lastChunkIdx_; }
+    const Chunk* ChunkAt(size_t idx) const { return chunks_ + idx; }
 
     // ─── EmplaceBatch ───────────────────────────────────────────────
 
