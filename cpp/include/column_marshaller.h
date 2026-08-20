@@ -62,12 +62,18 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
 
 static inline void SetRowPtr(char* buf, uint8_t* ptr) {
     uint64_t val = reinterpret_cast<uint64_t>(ptr);
-    memcpy(buf, &val, ROW_PTR_SIZE);
+    // Store lower 6 bytes directly (avoids libc memcpy call for non-power-of-2 size)
+    uint32_t lo; memcpy(&lo, &val, 4);
+    uint16_t hi; memcpy(&hi, reinterpret_cast<const char*>(&val) + 4, 2);
+    memcpy(buf, &lo, 4);
+    memcpy(buf + 4, &hi, 2);
 }
 
 static inline uint8_t* GetRowPtr(const char* buf) {
     uint64_t val = 0;
-    memcpy(&val, buf, ROW_PTR_SIZE);
+    uint32_t lo; memcpy(&lo, buf, 4);
+    uint16_t hi; memcpy(&hi, buf + 4, 2);
+    val = static_cast<uint64_t>(hi) << 32 | lo;
     return reinterpret_cast<uint8_t*>(val);
 }
 

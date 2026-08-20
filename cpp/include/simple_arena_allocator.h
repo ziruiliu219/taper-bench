@@ -29,6 +29,29 @@ public:
     SimpleArenaAllocator(const SimpleArenaAllocator&) = delete;
     SimpleArenaAllocator& operator=(const SimpleArenaAllocator&) = delete;
 
+    /// Reset arena for reuse: keep allocated chunks, reset bump pointer to start.
+    /// Avoids free/malloc cycle and page fault overhead on reuse.
+    void Reset() {
+        if (!chunks_.empty()) {
+            availBuf_ = chunks_[0];
+            availBytes_ = chunkSizes_[0];
+        } else {
+            availBuf_ = nullptr;
+            availBytes_ = 0;
+        }
+        // We only reuse the first (largest) chunk for simplicity.
+        // Free remaining chunks and keep only the first one with total capacity.
+        if (chunks_.size() > 1) {
+            // Merge: allocate one big chunk = totalBytes_, free all old
+            uint64_t total = totalBytes_;
+            ReleaseChunks();
+            AllocateChunk(total);
+        }
+        usedBytes_ = 0;
+        continuousUsedMemoryBytes_ = 0;
+        continuousUsed_ = false;
+    }
+
     uint8_t* Allocate(int64_t sizeInBytes) {
         if (sizeInBytes == 0) {
             static int64_t zeroAddress[1];
