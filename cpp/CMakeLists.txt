@@ -32,7 +32,7 @@ FetchContent_MakeAvailable(xxhash)
 
 add_executable(taper_bench src/taper_bench.cpp)
 target_include_directories(taper_bench PRIVATE include ${xxhash_SOURCE_DIR})
-target_link_libraries(taper_bench PRIVATE benchmark::benchmark)
+target_link_libraries(taper_bench PRIVATE benchmark::benchmark jemalloc)
 
 add_executable(profile_taper src/profile_taper.cpp)
 target_include_directories(profile_taper PRIVATE include ${xxhash_SOURCE_DIR})
