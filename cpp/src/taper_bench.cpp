@@ -17,7 +17,8 @@ struct BenchData {
     std::vector<std::vector<std::vector<uint8_t>>> strCols;
     std::vector<std::vector<int64_t>> intCols;
     std::vector<int64_t> hashes, values;
-    /// VarcharSlice arrays (ptr+len contiguous) — matches Rust &[&[u8]] layout
+    /// VarcharSlice arrays (ptr+len contiguous) — ma
+    // tches Rust &[&[u8]] layout
     std::vector<std::vector<taper::VarcharSlice>> strSlices;
     size_t nStr,nInt,totalRows;
 };
@@ -104,6 +105,7 @@ static void BM_Taper(benchmark::State& st){
     size_t distinctKeys = numKeys + numMisses;
     size_t minSlots = std::max(static_cast<size_t>(distinctKeys / 0.85), size_t(8));
     size_t numChunks = 1; while(numChunks * 8 < minSlots) numChunks *= 2;
+    RunTaper(d, numChunks); // warmup: pre-fault pages (matches Criterion's 3s warmup)
     for(auto _:st)RunTaper(d,numChunks);
     st.SetItemsProcessed(st.iterations()*d.totalRows);
 }
