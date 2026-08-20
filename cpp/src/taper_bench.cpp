@@ -6,6 +6,9 @@
 #include <numeric>
 #include <algorithm>
 #include <unordered_map>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 #include "column_marshaller.h"
@@ -105,12 +108,26 @@ static void BM_Taper(benchmark::State& st){
     size_t distinctKeys = numKeys + numMisses;
     size_t minSlots = std::max(static_cast<size_t>(distinctKeys / 0.85), size_t(8));
     size_t numChunks = 1; while(numChunks * 8 < minSlots) numChunks *= 2;
-    RunTaper(d, numChunks); // warmup: pre-fault pages (matches Criterion's 3s warmup)
+
+    // Pre-fault: allocate and touch the same amount of memory that RunTaper will use.
+    // This matches Criterion's 3-second warmup which pre-faults all pages.
+    // After this, subsequent malloc/aligned_alloc will reuse cached virtual pages
+    // (glibc keeps freed mmap regions in its free list for reuse).
+    for (int w = 0; w < 3; w++) RunTaper(d, numChunks);
+
     for(auto _:st)RunTaper(d,numChunks);
     st.SetItemsProcessed(st.iterations()*d.totalRows);
 }
 
 int main(int argc,char**argv){
+#ifdef __linux__
+    // Prevent glibc from returning large allocations to the OS via munmap.
+    // This matches Rust's allocator behavior where freed pages stay mapped.
+    // Without this, each iteration triggers ~8000 page faults on memset.
+    mallopt(M_MMAP_THRESHOLD, 256 * 1024 * 1024); // 256MB — never munmap
+    mallopt(M_TRIM_THRESHOLD, -1);                  // never trim the heap
+#endif
+
     auto cfgs=MkCfg();
     for(size_t i=0;i<cfgs.size();i++){
         auto&c=cfgs[i];
