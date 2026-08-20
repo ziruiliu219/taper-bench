@@ -8,6 +8,9 @@
 #include <cassert>
 #include <vector>
 #include <algorithm>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include "taper_hashtable.h"
 #include "row_container.h"
 #include "simple_arena_allocator.h"
@@ -136,6 +139,27 @@ public:
 
     int32_t AggStateOffset() const { return aggOffset_; }
     size_t NumGroups() const { return aggRows_.NumRows(); }
+
+    /// Sum all agg i64 values across all groups (for verification).
+    int64_t AggChecksum() const {
+        int64_t sum = 0;
+        // Iterate hash table: every occupied slot has a row pointer
+        size_t numChunks = static_cast<size_t>(table_.LastChunkIdx()) + 1;
+        for (size_t ci = 0; ci < numChunks; ci++) {
+            const auto* chunk = table_.ChunkAt(ci);
+            for (uint32_t s = 0; s < kSlotsPerChunk; s++) {
+                if (chunk->tags[s] != kEmptyTag) {
+                    uint64_t val = 0;
+                    memcpy(&val, chunk->values[s].bytes, ROW_PTR_SIZE);
+                    const char* row = reinterpret_cast<const char*>(val);
+                    int64_t aggVal;
+                    memcpy(&aggVal, row + aggOffset_, sizeof(aggVal));
+                    sum += aggVal;
+                }
+            }
+        }
+        return sum;
+    }
 
     void EmplaceTableWithDecode(const int64_t* hashes, int32_t rowsNum,
         const std::vector<ColumnInput>& columns, const int64_t* aggValues)
@@ -274,12 +298,47 @@ private:
             int32_t offset = colOffsets_[colIdx];
             if (colDescs_[colIdx] == ColumnDesc::Int64) {
                 const int64_t* inputValues = columns[colIdx].int64Data;
+#ifdef __ARM_NEON
+                // NEON: compare 2 × i64 per iteration (matches Rust batch_compare_decoded_i64_neon)
+                int32_t i = idxFrom;
+                for (; i + 2 <= count; i += 2) {
+                    int32_t idx0 = workingUpdateIndices_[i];
+                    int32_t idx1 = workingUpdateIndices_[i + 1];
+                    int64_t stored0 = RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups_[idx0]), offset);
+                    int64_t stored1 = RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups_[idx1]), offset);
+                    int64_t input0 = inputValues[idx0];
+                    int64_t input1 = inputValues[idx1];
+
+                    int64x2_t vStored = vcombine_s64(vcreate_s64(static_cast<uint64_t>(stored0)),
+                                                     vcreate_s64(static_cast<uint64_t>(stored1)));
+                    int64x2_t vInput = vcombine_s64(vcreate_s64(static_cast<uint64_t>(input0)),
+                                                    vcreate_s64(static_cast<uint64_t>(input1)));
+                    uint64x2_t cmp = vceqq_s64(vStored, vInput);
+
+                    if (vgetq_lane_u64(cmp, 0) == 0) { // not equal
+                        std::swap(workingUpdateIndices_[i], workingUpdateIndices_[idxFrom]);
+                        idxFrom++;
+                    }
+                    if (vgetq_lane_u64(cmp, 1) == 0) { // not equal
+                        std::swap(workingUpdateIndices_[i + 1], workingUpdateIndices_[idxFrom]);
+                        idxFrom++;
+                    }
+                }
+                // Scalar tail
+                for (; i < count; i++) {
+                    int32_t idx = workingUpdateIndices_[i];
+                    if (RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups_[idx]), offset) != inputValues[idx]) {
+                        std::swap(workingUpdateIndices_[i], workingUpdateIndices_[idxFrom]); idxFrom++;
+                    }
+                }
+#else
                 for (int32_t i = idxFrom; i < count; i++) {
                     int32_t idx = workingUpdateIndices_[i];
                     if (RowContainer::ReadValue<int64_t>(reinterpret_cast<const char*>(groups_[idx]), offset) != inputValues[idx]) {
                         std::swap(workingUpdateIndices_[i], workingUpdateIndices_[idxFrom]); idxFrom++;
                     }
                 }
+#endif
             } else {
                 BatchCompareVarcharDecodedNoNull(colIdx, count, offset, columns[colIdx].vcSlices, workingUpdateIndices_.data(), idxFrom);
             }

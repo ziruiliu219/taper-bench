@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# Enable LTO (Link-Time Optimization) for Release builds — matches Rust's default LTO in bench profile
+include(CheckIPOSupported)
+check_ipo_supported(RESULT LTO_SUPPORTED)
+if(LTO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
+
 # Don't override CXX_FLAGS if user provided them via command line
 if(NOT CMAKE_CXX_FLAGS_RELEASE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=armv8-a+crc")

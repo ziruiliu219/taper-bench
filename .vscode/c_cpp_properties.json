@@ -3,15 +3,18 @@
     {
       "name": "macos-clang-arm64",
       "includePath": [
+        "${workspaceFolder}/cpp/include",
+        "${workspaceFolder}/cpp/build/_deps/xxhash-src",
+        "${workspaceFolder}/cpp/build/_deps/benchmark-src/include",
+        "${workspaceFolder}/cpp/cmake-build-debug/_deps/benchmark-src/include",
+        "${workspaceFolder}/cpp/cmake-build-debug/_deps/xxhash-src",
         "${workspaceFolder}/**"
       ],
+      "configurationProvider": "ms-vscode.cmake-tools",
       "compilerPath": "/usr/bin/clang",
       "cStandard": "${default}",
-      "cppStandard": "${default}",
-      "intelliSenseMode": "macos-clang-arm64",
-      "compilerArgs": [
-        ""
-      ]
+      "cppStandard": "c++17",
+      "intelliSenseMode": "macos-clang-arm64"
     }
   ],
   "version": 4
