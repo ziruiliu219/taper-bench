@@ -35,16 +35,10 @@ struct ColumnInput {
 
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
-/// Inline short copy: avoids libc __memcpy_generic call overhead for small buffers.
-static inline void InlineCopy(uint8_t* __restrict dst, const uint8_t* __restrict src, size_t n) {
-    // For typical varchar keys (10-30 bytes), this generates ldp/stp without a function call.
-    for (size_t i = 0; i < n; i++) dst[i] = src[i];
-}
-
 inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, size_t len) {
     uint8_t rowLenSize = ComputeRowLenSize(len); *writePos = rowLenSize;
     uint32_t l32 = static_cast<uint32_t>(len); memcpy(writePos+1, &l32, rowLenSize);
-    if (len) InlineCopy(writePos+1+rowLenSize, data, len);
+    if (len) memcpy(writePos+1+rowLenSize, data, len);
     return 1+rowLenSize+len;
 }
 
@@ -62,8 +56,7 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
     const uint8_t* stored = rowData+1+rowLenSize;
-    for (size_t i = 0; i < stringLen; i++) { if (stored[i] != input[i]) return false; }
-    return true;
+    return memcmp(stored, input, stringLen) == 0;
 }
 
 // ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────
