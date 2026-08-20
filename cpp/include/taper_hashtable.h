@@ -73,7 +73,7 @@ struct alignas(128) Chunk {
     uint8_t _pad[8];                       // offset 72, 8 bytes
     SlotValue values[kSlotsPerChunk];      // offset 80, 48 bytes
 
-    uint64_t TagsU64() const { uint64_t v; memcpy(&v, tags, 8); return v; }
+    uint64_t TagsU64() const { uint64_t v; __builtin_memcpy(&v, tags, 8); return v; }
 };
 static_assert(sizeof(Chunk) == 128);
 static_assert(offsetof(Chunk, tags) == 0);

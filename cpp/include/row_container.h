@@ -77,8 +77,8 @@ public:
     static bool IsNullAt(const char* r, uint32_t nb, uint8_t nm) { return (reinterpret_cast<const uint8_t*>(r)[nb] & nm) != 0; }
     static void SetNullAt(char* r, uint32_t nb, uint8_t nm) { reinterpret_cast<uint8_t*>(r)[nb] |= nm; }
     static void ClearNullAt(char* r, uint32_t nb, uint8_t nm) { reinterpret_cast<uint8_t*>(r)[nb] &= ~nm; }
-    template<typename T> static T ReadValue(const char* r, int32_t off) { T v; memcpy(&v, r+off, sizeof(T)); return v; }
-    template<typename T> static void StoreValue(char* r, int32_t off, T v) { memcpy(r+off, &v, sizeof(T)); }
+    template<typename T> static T ReadValue(const char* r, int32_t off) { T v; __builtin_memcpy(&v, r+off, sizeof(T)); return v; }
+    template<typename T> static void StoreValue(char* r, int32_t off, T v) { __builtin_memcpy(r+off, &v, sizeof(T)); }
 
     RowColumn ColumnAt(int32_t i) const { return rowColumns_[i]; }
     int32_t AggStateOffset() const { return aggStateOffset_; }

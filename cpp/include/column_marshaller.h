@@ -36,23 +36,30 @@ struct ColumnInput {
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
 inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, size_t len) {
-    uint8_t rowLenSize = ComputeRowLenSize(len); *writePos = rowLenSize;
-    uint32_t l32 = static_cast<uint32_t>(len); memcpy(writePos+1, &l32, rowLenSize);
-    if (len) memcpy(writePos+1+rowLenSize, data, len);
+    uint8_t rowLenSize = ComputeRowLenSize(len);
+    writePos[0] = rowLenSize;
+    // Write length directly (avoid libc memcpy for 1-4 bytes)
+    switch (rowLenSize) {
+    case 1: writePos[1] = static_cast<uint8_t>(len); break;
+    case 2: { uint16_t v = static_cast<uint16_t>(len); __builtin_memcpy(writePos+1, &v, 2); break; }
+    case 4: { uint32_t v = static_cast<uint32_t>(len); __builtin_memcpy(writePos+1, &v, 4); break; }
+    }
+    // Copy string data — use __builtin_memcpy so compiler can inline for small sizes
+    if (len) __builtin_memcpy(writePos+1+rowLenSize, data, len);
     return 1+rowLenSize+len;
 }
 
 inline size_t ComputeVarCharSerializedSize(const uint8_t* data) {
     uint8_t rowLenSize = *data; if (!rowLenSize) return 1;
     size_t stringLen=0;
-    switch(rowLenSize){case 1:stringLen=*(data+1);break;case 2:{uint16_t v;memcpy(&v,data+1,2);stringLen=v;break;}default:{uint32_t v;memcpy(&v,data+1,4);stringLen=v;}}
+    switch(rowLenSize){case 1:stringLen=*(data+1);break;case 2:{uint16_t v;__builtin_memcpy(&v,data+1,2);stringLen=v;break;}default:{uint32_t v;__builtin_memcpy(&v,data+1,4);stringLen=v;}}
     return 1+rowLenSize+stringLen;
 }
 
 inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, size_t inputLen) {
     uint8_t rowLenSize = *rowData; if(!rowLenSize) return false;
     size_t stringLen=0;
-    switch(rowLenSize){case 1:stringLen=*(rowData+1);break;case 2:{uint16_t v;memcpy(&v,rowData+1,2);stringLen=v;break;}default:{uint32_t v;memcpy(&v,rowData+1,4);stringLen=v;}}
+    switch(rowLenSize){case 1:stringLen=*(rowData+1);break;case 2:{uint16_t v;__builtin_memcpy(&v,rowData+1,2);stringLen=v;break;}default:{uint32_t v;__builtin_memcpy(&v,rowData+1,4);stringLen=v;}}
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
     const uint8_t* stored = rowData+1+rowLenSize;
@@ -63,18 +70,14 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
 
 static inline void SetRowPtr(char* buf, uint8_t* ptr) {
     uint64_t val = reinterpret_cast<uint64_t>(ptr);
-    // Store lower 6 bytes directly (avoids libc memcpy call for non-power-of-2 size)
-    uint32_t lo; memcpy(&lo, &val, 4);
-    uint16_t hi; memcpy(&hi, reinterpret_cast<const char*>(&val) + 4, 2);
-    memcpy(buf, &lo, 4);
-    memcpy(buf + 4, &hi, 2);
+    // Single 6-byte store — compiler inlines to str+strh (no libc memcpy)
+    __builtin_memcpy(buf, &val, 6);
 }
 
 static inline uint8_t* GetRowPtr(const char* buf) {
     uint64_t val = 0;
-    uint32_t lo; memcpy(&lo, buf, 4);
-    uint16_t hi; memcpy(&hi, buf + 4, 2);
-    val = static_cast<uint64_t>(hi) << 32 | lo;
+    // Single 6-byte load — compiler inlines to ldr+ldrh (no libc memcpy)
+    __builtin_memcpy(&val, buf, 6);
     return reinterpret_cast<uint8_t*>(val);
 }
 
@@ -157,10 +160,10 @@ public:
             for (uint32_t s = 0; s < kSlotsPerChunk; s++) {
                 if (chunk->tags[s] != kEmptyTag) {
                     uint64_t val = 0;
-                    memcpy(&val, chunk->values[s].bytes, ROW_PTR_SIZE);
+                    __builtin_memcpy(&val, chunk->values[s].bytes, ROW_PTR_SIZE);
                     const char* row = reinterpret_cast<const char*>(val);
                     int64_t aggVal;
-                    memcpy(&aggVal, row + aggOffset_, sizeof(aggVal));
+                    __builtin_memcpy(&aggVal, row + aggOffset_, sizeof(aggVal));
                     sum += aggVal;
                 }
             }
@@ -263,14 +266,14 @@ private:
                 RowContainer::ClearNullAt(row, colNullBytes_[ci], colNullMasks_[ci]);
                 wp += SerializeVarcharToBuffer(wp, cols[ci].vcSlices[rowIdx].ptr, cols[ci].vcSlices[rowIdx].len);
             }
-            memcpy(row + varcharSlotOffset_, &blockStart, sizeof(blockStart));
+            __builtin_memcpy(row + varcharSlotOffset_, &blockStart, sizeof(blockStart));
         } else if (!varcharColIndices_.empty()) {
             int32_t ci = varcharColIndices_[0];
             RowContainer::ClearNullAt(row, colNullBytes_[ci], colNullMasks_[ci]);
             size_t len = cols[ci].vcSlices[rowIdx].len;
             uint8_t* ap = aggRows_.ArenaAlloc(1 + ComputeRowLenSize(len) + len);
             SerializeVarcharToBuffer(ap, cols[ci].vcSlices[rowIdx].ptr, len);
-            memcpy(row + colOffsets_[ci], &ap, sizeof(ap));
+            __builtin_memcpy(row + colOffsets_[ci], &ap, sizeof(ap));
         }
         for (int32_t ci = 0; ci < groupColNum_; ci++) {
             if (colDescs_[ci] == ColumnDesc::Int64) {
@@ -363,7 +366,7 @@ private:
             if (!mergedVarcharCache_.empty()) {
                 arenaPtr = mergedVarcharCache_[static_cast<size_t>(idx) * mergedVarcharCacheCount_ + vcPos];
             } else {
-                memcpy(&arenaPtr, reinterpret_cast<const char*>(groups_[idx]) + offset, sizeof(arenaPtr));
+                __builtin_memcpy(&arenaPtr, reinterpret_cast<const char*>(groups_[idx]) + offset, sizeof(arenaPtr));
             }
             if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, inputSlices[idx].ptr, inputSlices[idx].len)) {
                 std::swap(indices[i], indices[idxFrom]);
@@ -374,7 +377,7 @@ private:
 
     void GetAllMergedVarcharPtrs(const char* row, const uint8_t** outPtrs, int32_t maxCount) const {
         const uint8_t* blockPtr;
-        memcpy(&blockPtr, row + varcharSlotOffset_, sizeof(blockPtr));
+        __builtin_memcpy(&blockPtr, row + varcharSlotOffset_, sizeof(blockPtr));
         if (!blockPtr) { memset(outPtrs, 0, maxCount * sizeof(uint8_t*)); return; }
         const uint8_t* pos = blockPtr;
         for (int32_t i = 0; i < maxCount; i++) {
@@ -397,7 +400,7 @@ private:
                     return false;
             } else {
                 const uint8_t* arenaPtr;
-                memcpy(&arenaPtr, row + colOffsets_[colIdx], sizeof(arenaPtr));
+                __builtin_memcpy(&arenaPtr, row + colOffsets_[colIdx], sizeof(arenaPtr));
                 if (!arenaPtr || !CompareVarcharFromRow(arenaPtr, columns[colIdx].vcSlices[rowIdx].ptr, columns[colIdx].vcSlices[rowIdx].len))
                     return false;
             }

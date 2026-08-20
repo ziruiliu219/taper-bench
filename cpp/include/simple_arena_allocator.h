@@ -111,7 +111,7 @@ private:
         auto newSpace = continuousUsedMemoryBytes_ + static_cast<uint64_t>(sizeInBytes);
         if (availBytes_ < static_cast<uint64_t>(sizeInBytes)) {
             AllocateChunk(GetNextSize(newSpace));
-            memcpy(availBuf_, start, continuousUsedMemoryBytes_);
+            __builtin_memcpy(availBuf_, start, continuousUsedMemoryBytes_);
             start = availBuf_;
             availBuf_ += continuousUsedMemoryBytes_;
             availBytes_ -= continuousUsedMemoryBytes_;
