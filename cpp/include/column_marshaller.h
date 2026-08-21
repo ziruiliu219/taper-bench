@@ -104,10 +104,41 @@ static TAPER_FORCE_INLINE bool InlineMemEqual(const uint8_t* a, const uint8_t* b
 
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
+/// Inline short copy for 8-16 bytes. Avoids calling libc __memcpy_generic which
+/// is the proven bottleneck on Kunpeng 920 (64% of cycles in C2 stage).
+/// Uses __builtin_memcpy with fixed size so compiler emits ldr/str, not bl memcpy.
+static TAPER_FORCE_INLINE void CopyShortBytes(uint8_t* dst, const uint8_t* src, size_t len) {
+    if (__builtin_expect(len >= 8 && len <= 16, 1)) {
+        uint64_t first, last;
+        __builtin_memcpy(&first, src, 8);
+        __builtin_memcpy(&last, src + len - 8, 8);
+        __builtin_memcpy(dst, &first, 8);
+        __builtin_memcpy(dst + len - 8, &last, 8);
+        return;
+    }
+    if (len >= 4 && len < 8) {
+        uint32_t first, last;
+        __builtin_memcpy(&first, src, 4);
+        __builtin_memcpy(&last, src + len - 4, 4);
+        __builtin_memcpy(dst, &first, 4);
+        __builtin_memcpy(dst + len - 4, &last, 4);
+        return;
+    }
+    if (len > 0 && len < 4) {
+        dst[0] = src[0];
+        if (len > 1) dst[len - 1] = src[len - 1];
+        if (len > 2) dst[1] = src[1];
+        return;
+    }
+    if (len > 16) {
+        memcpy(dst, src, len);
+    }
+}
+
 inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, size_t len) {
     uint8_t rowLenSize = ComputeRowLenSize(len); *writePos = rowLenSize;
     uint32_t l32 = static_cast<uint32_t>(len); memcpy(writePos+1, &l32, rowLenSize);
-    if (len) memcpy(writePos+1+rowLenSize, data, len);
+    if (len) CopyShortBytes(writePos+1+rowLenSize, data, len);
     return 1+rowLenSize+len;
 }
 
