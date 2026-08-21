@@ -65,3 +65,6 @@ target_include_directories(cpp_micro_cases PRIVATE include ${xxhash_SOURCE_DIR})
 
 add_executable(cpp_micro_pipeline src/micro_pipeline_bench.cpp)
 target_include_directories(cpp_micro_pipeline PRIVATE include ${xxhash_SOURCE_DIR})
+
+add_executable(cpp_micro_functions src/micro_functions_bench.cpp)
+target_include_directories(cpp_micro_functions PRIVATE include ${xxhash_SOURCE_DIR})
