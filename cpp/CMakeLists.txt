@@ -56,3 +56,6 @@ option(PROFILE_INSTRUMENTATION "Enable compile-time profile counters" OFF)
 if(PROFILE_INSTRUMENTATION)
     target_compile_definitions(cpp_profile_taper PRIVATE PROFILE_INSTRUMENTATION)
 endif()
+
+add_executable(cpp_micro_hashmap src/micro_hashmap_bench.cpp)
+target_include_directories(cpp_micro_hashmap PRIVATE include ${xxhash_SOURCE_DIR})
