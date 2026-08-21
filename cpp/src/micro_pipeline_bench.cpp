@@ -201,8 +201,20 @@ static size_t RunHashmapPlusNewRow(const BenchData& d, size_t numChunks) {
 int main(int argc, char** argv) {
     double sel = 0.1;
     size_t numIters = 10;
-    if (argc > 1) sel = std::atof(argv[1]);
-    if (argc > 2) numIters = static_cast<size_t>(std::atoi(argv[2]));
+    const char* stage = nullptr; // null = run all
+
+    for (int i = 1; i < argc; i++) {
+        if (i == 1) sel = std::atof(argv[i]);
+        else if (i == 2) {
+            // Check if it's a stage name or iteration count
+            if (argv[i][0] >= 'A' && argv[i][0] <= 'Z') {
+                stage = argv[i];
+            } else {
+                numIters = static_cast<size_t>(std::atoi(argv[i]));
+            }
+        }
+        else if (i == 3) numIters = static_cast<size_t>(std::atoi(argv[i]));
+    }
 
     size_t numKeys = static_cast<size_t>(HT_SIZE * LOAD_FACTOR);
     size_t numMisses = NUM_PROBE_ROWS - static_cast<size_t>(NUM_PROBE_ROWS * sel);
@@ -212,12 +224,14 @@ int main(int argc, char** argv) {
     while (numChunks * 8 < minSlots) numChunks *= 2;
 
     fprintf(stderr, "=== C++ Pipeline Micro Bench ===\n");
-    fprintf(stderr, "sel=%.1f, iters=%zu, totalRows=%zu, numChunks=%zu\n\n", sel, numIters, numKeys + NUM_PROBE_ROWS, numChunks);
-    fprintf(stderr, "Generating data...\n");
+    fprintf(stderr, "sel=%.1f, iters=%zu, totalRows=%zu, numChunks=%zu\n", sel, numIters, numKeys + NUM_PROBE_ROWS, numChunks);
+    if (stage) fprintf(stderr, "Stage filter: %s\n", stage);
+    fprintf(stderr, "\nGenerating data...\n");
     BenchData data = GenData(numKeys, sel);
     fprintf(stderr, "Done.\n\n");
 
-    auto bench = [&](const char* name, size_t(*fn)(const BenchData&, size_t)) {
+    auto bench = [&](const char* name, const char* tag, size_t(*fn)(const BenchData&, size_t)) {
+        if (stage && strcmp(stage, tag) != 0) return;
         volatile size_t w = fn(data, numChunks); (void)w;
         auto t0 = Clock::now();
         volatile size_t result = 0;
@@ -228,10 +242,10 @@ int main(int argc, char** argv) {
     };
 
     printf("=== Results (sel=%.1f, %zu iters) ===\n", sel, numIters);
-    bench("A: hashmap_only", RunHashmapOnly);
-    bench("C: hashmap+newrow", RunHashmapPlusNewRow);
-    bench("C2: hashmap+newrow+serialize", RunHashmapPlusSerialize);
-    bench("D: full_pipeline", RunFullPipeline);
+    bench("A: hashmap_only", "A", RunHashmapOnly);
+    bench("C: hashmap+newrow", "C", RunHashmapPlusNewRow);
+    bench("C2: hashmap+newrow+serialize", "C2", RunHashmapPlusSerialize);
+    bench("D: full_pipeline", "D", RunFullPipeline);
 
     return 0;
 }

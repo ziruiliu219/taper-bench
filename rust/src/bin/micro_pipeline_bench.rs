@@ -184,7 +184,21 @@ fn run_full_pipeline(data: &BenchData, num_chunks: usize) -> usize {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let sel: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.1);
-    let num_iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+
+    // Second arg: stage filter (A/C/C2/D) or iteration count
+    let mut num_iters: usize = 10;
+    let mut stage_filter: Option<&str> = None;
+
+    if let Some(arg2) = args.get(2) {
+        if arg2.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+            stage_filter = Some(arg2.as_str());
+        } else {
+            num_iters = arg2.parse().unwrap_or(10);
+        }
+    }
+    if let Some(arg3) = args.get(3) {
+        num_iters = arg3.parse().unwrap_or(10);
+    }
 
     let num_keys = (HT_SIZE as f64 * LOAD_FACTOR) as usize;
     let num_misses = NUM_PROBE_ROWS - (NUM_PROBE_ROWS as f64 * sel) as usize;
@@ -193,12 +207,16 @@ fn main() {
     let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
 
     eprintln!("=== Rust Pipeline Micro Bench ===");
-    eprintln!("sel={:.1}, iters={}, totalRows={}, numChunks={}\n", sel, num_iters, num_keys + NUM_PROBE_ROWS, num_chunks);
-    eprintln!("Generating data...");
+    eprintln!("sel={:.1}, iters={}, totalRows={}, numChunks={}", sel, num_iters, num_keys + NUM_PROBE_ROWS, num_chunks);
+    if let Some(s) = stage_filter { eprintln!("Stage filter: {}", s); }
+    eprintln!("\nGenerating data...");
     let data = gen_data(num_keys, sel);
     eprintln!("Done.\n");
 
-    let bench = |name: &str, f: fn(&BenchData, usize) -> usize| {
+    let bench = |name: &str, tag: &str, f: fn(&BenchData, usize) -> usize| {
+        if let Some(filter) = stage_filter {
+            if filter != tag { return; }
+        }
         let _ = f(&data, num_chunks); // warmup
         let t0 = Instant::now();
         let mut result = 0;
@@ -208,8 +226,8 @@ fn main() {
     };
 
     println!("=== Results (sel={:.1}, {} iters) ===", sel, num_iters);
-    bench("A: hashmap_only", run_hashmap_only);
-    bench("C: hashmap+newrow", run_hashmap_plus_newrow);
-    bench("C2: hashmap+newrow+serialize", run_hashmap_plus_serialize);
-    bench("D: full_pipeline", run_full_pipeline);
+    bench("A: hashmap_only", "A", run_hashmap_only);
+    bench("C: hashmap+newrow", "C", run_hashmap_plus_newrow);
+    bench("C2: hashmap+newrow+serialize", "C2", run_hashmap_plus_serialize);
+    bench("D: full_pipeline", "D", run_full_pipeline);
 }
