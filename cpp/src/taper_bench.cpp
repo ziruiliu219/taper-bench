@@ -109,11 +109,11 @@ static void BM_Taper(benchmark::State& st){
     size_t minSlots = std::max(static_cast<size_t>(distinctKeys / 0.85), size_t(8));
     size_t numChunks = 1; while(numChunks * 8 < minSlots) numChunks *= 2;
 
-    // Pre-fault: allocate and touch the same amount of memory that RunTaper will use.
-    // This matches Criterion's 3-second warmup which pre-faults all pages.
-    // After this, subsequent malloc/aligned_alloc will reuse cached virtual pages
-    // (glibc keeps freed mmap regions in its free list for reuse).
+    // Pre-fault: only needed on Linux where glibc may munmap freed pages.
+    // macOS doesn't have this issue — its allocator retains pages.
+#ifdef __linux__
     for (int w = 0; w < 3; w++) RunTaper(d, numChunks);
+#endif
 
     for(auto _:st)RunTaper(d,numChunks);
     st.SetItemsProcessed(st.iterations()*d.totalRows);
