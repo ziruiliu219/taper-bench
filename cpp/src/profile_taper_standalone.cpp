@@ -1,10 +1,13 @@
 /// Standalone profile runner for Taper C++ — no Google Benchmark dependency.
-/// Identical workload to the Criterion Rust bench, but with manual timing.
+/// Identical workload to the Rust profile runner.
 ///
 /// Usage:
-///   ./cpp_profile_taper [sel=0.1|0.9]
+///   ./cpp_profile_taper <sel> [iterations] [--profile-wait]
 ///
-/// Default: sel=0.1 (low selectivity = many new groups, stresses insertion path)
+/// Examples:
+///   ./cpp_profile_taper 0.1           # sel=0.1, 10 iterations
+///   ./cpp_profile_taper 0.9 100       # sel=0.9, 100 iterations
+///   ./cpp_profile_taper 0.1 50 --profile-wait  # wait for Enter before measured iters
 
 #include <cstdio>
 #include <cstdint>
@@ -16,6 +19,14 @@
 #include <numeric>
 #include <algorithm>
 #include <random>
+
+#ifdef _WIN32
+#include <process.h>
+#define GETPID() _getpid()
+#else
+#include <unistd.h>
+#define GETPID() getpid()
+#endif
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -58,7 +69,6 @@ static constexpr size_t HT_SIZE = 16384;
 static constexpr double LOAD_FACTOR = 0.50;
 static constexpr size_t NUM_PROBE_ROWS = 1000000;
 static constexpr size_t BATCH_SIZE = 410;
-static constexpr size_t NUM_ITERS = 10;
 static constexpr uint64_t SEED = 42;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -91,7 +101,6 @@ static BenchData GenData(size_t nKeys, double sel) {
             d.strCols[c][i].assign(s.begin(), s.end());
         }
     }
-    // No int cols for 4str_0int
     std::vector<int64_t> bh(nKeys);
     for (size_t i = 0; i < nKeys; i++) {
         uint64_t h = 0;
@@ -127,7 +136,6 @@ static BenchData GenData(size_t nKeys, double sel) {
         ph.push_back(static_cast<int64_t>(h));
     }
 
-    // Shuffle
     std::vector<size_t> ord(NUM_PROBE_ROWS);
     std::iota(ord.begin(), ord.end(), 0);
     for (size_t i = NUM_PROBE_ROWS - 1; i > 0; i--)
@@ -151,7 +159,6 @@ static BenchData GenData(size_t nKeys, double sel) {
     d.values = bv;
     d.values.insert(d.values.end(), pv.begin(), pv.end());
 
-    // Build VarcharSlice arrays
     d.strSlices.resize(NUM_STR_COLS);
     for (size_t c = 0; c < NUM_STR_COLS; c++) {
         d.strSlices[c].resize(d.totalRows);
@@ -197,15 +204,35 @@ static size_t RunWorkload(const BenchData& d, size_t numChunks) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Timing helper
+// ═══════════════════════════════════════════════════════════════════
+
+using Clock = std::chrono::high_resolution_clock;
+static double elapsed_ms(Clock::time_point t0, Clock::time_point t1) {
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════
 
 int main(int argc, char** argv) {
     double sel = 0.1;
-    if (argc > 1) {
-        sel = std::atof(argv[1]);
-        if (sel <= 0.0 || sel > 1.0) { fprintf(stderr, "sel must be in (0,1]\n"); return 1; }
+    size_t numIters = 10;
+    bool profileWait = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--profile-wait") == 0) {
+            profileWait = true;
+        } else if (i == 1) {
+            sel = std::atof(argv[i]);
+        } else if (i == 2) {
+            numIters = static_cast<size_t>(std::atoi(argv[i]));
+        }
     }
+
+    if (sel <= 0.0 || sel > 1.0) { fprintf(stderr, "sel must be in (0,1]\n"); return 1; }
+    if (numIters == 0) { fprintf(stderr, "iterations must be > 0\n"); return 1; }
 
     size_t numKeys = static_cast<size_t>(HT_SIZE * LOAD_FACTOR);
     size_t numMisses = NUM_PROBE_ROWS - static_cast<size_t>(NUM_PROBE_ROWS * sel);
@@ -218,45 +245,57 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Config: 4str_0int, ht=%zu, lf=%.2f, sel=%.1f\n", HT_SIZE, LOAD_FACTOR, sel);
     fprintf(stderr, "numKeys=%zu, numProbe=%zu, totalRows=%zu\n", numKeys, NUM_PROBE_ROWS, numKeys + NUM_PROBE_ROWS);
     fprintf(stderr, "distinctKeys=%zu, numChunks=%zu, capacity=%zu\n", distinctKeys, numChunks, numChunks * 8);
-    fprintf(stderr, "Iterations: %zu (+ 1 warmup)\n", NUM_ITERS);
+    fprintf(stderr, "Iterations: %zu (+ 1 warmup)\n", numIters);
+
+    // Data generation (timed separately)
     fprintf(stderr, "Generating data...\n");
-
+    auto tGen0 = Clock::now();
     BenchData data = GenData(numKeys, sel);
-    fprintf(stderr, "Data generated. totalRows=%zu\n\n", data.totalRows);
+    auto tGen1 = Clock::now();
+    fprintf(stderr, "Data generated. totalRows=%zu (%.1f ms)\n\n", data.totalRows, elapsed_ms(tGen0, tGen1));
 
-    // Warmup (pre-fault pages, warm caches)
+    // Warmup (timed separately)
     fprintf(stderr, "Warmup...\n");
+    auto tWarm0 = Clock::now();
     volatile size_t warmup_groups = RunWorkload(data, numChunks);
-    (void)warmup_groups;
-    fprintf(stderr, "Warmup done (groups=%zu)\n\n", (size_t)warmup_groups);
+    auto tWarm1 = Clock::now();
+    fprintf(stderr, "Warmup done (groups=%zu, %.1f ms)\n\n", (size_t)warmup_groups, elapsed_ms(tWarm0, tWarm1));
+
+    // Profile-wait mode
+    if (profileWait) {
+        fprintf(stderr, "READY pid=%d\n", GETPID());
+        fprintf(stderr, "Attach perf then press Enter to start measured iterations...\n");
+        getchar();
+    }
 
 #ifdef PROFILE_INSTRUMENTATION
-    // Reset counters after warmup
     memset(&g_counters, 0, sizeof(g_counters));
 #endif
 
     // Timed iterations
-    fprintf(stderr, "Running %zu iterations...\n", NUM_ITERS);
-    auto t0 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "Running %zu iterations...\n", numIters);
+    auto t0 = Clock::now();
 
     volatile size_t groups = 0;
-    for (size_t iter = 0; iter < NUM_ITERS; iter++) {
+    for (size_t iter = 0; iter < numIters; iter++) {
         groups = RunWorkload(data, numChunks);
     }
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double elapsed_ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
-    double per_iter_ns = elapsed_ns / NUM_ITERS;
-    double per_iter_ms = per_iter_ns / 1e6;
+    auto t1 = Clock::now();
+    double total_ms = elapsed_ms(t0, t1);
+    double per_iter_ms = total_ms / numIters;
+    double per_iter_ns = per_iter_ms * 1e6;
     double items_per_sec = static_cast<double>(data.totalRows) / (per_iter_ns / 1e9);
 
     printf("=== Results ===\n");
-    printf("Total elapsed:     %.3f ms\n", elapsed_ns / 1e6);
+    printf("Setup time:        %.3f ms\n", elapsed_ms(tGen0, tGen1));
+    printf("Warmup time:       %.3f ms\n", elapsed_ms(tWarm0, tWarm1));
+    printf("Workload total:    %.3f ms\n", total_ms);
     printf("Per iteration:     %.3f ms\n", per_iter_ms);
     printf("ns/iteration:      %.0f\n", per_iter_ns);
     printf("Items/sec:         %.3f M/s\n", items_per_sec / 1e6);
     printf("Groups:            %zu\n", (size_t)groups);
-    printf("Checksum (groups): %zu\n", (size_t)groups); // prevent DCE
+    printf("Checksum (groups): %zu\n", (size_t)groups);
 
 #ifdef PROFILE_INSTRUMENTATION
     printf("\n=== Instrumentation ===\n");

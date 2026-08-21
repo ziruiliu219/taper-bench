@@ -2,10 +2,14 @@
 //! Identical workload to the C++ profile runner.
 //!
 //! Usage:
-//!   ./rust_profile_taper [sel]
+//!   ./profile_taper_standalone <sel> [iterations] [--profile-wait]
 //!
-//! Default: sel=0.1
+//! Examples:
+//!   ./profile_taper_standalone 0.1           # sel=0.1, 10 iterations
+//!   ./profile_taper_standalone 0.9 100       # sel=0.9, 100 iterations
+//!   ./profile_taper_standalone 0.1 50 --profile-wait
 
+use std::io::{self, BufRead};
 use std::time::Instant;
 use taper_hashmap::column_marshaller::{TaperColumnSerializeHandler, ColumnDesc, ColumnInput};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
@@ -20,12 +24,10 @@ const HT_SIZE: usize = 16384;
 const LOAD_FACTOR: f64 = 0.50;
 const NUM_PROBE_ROWS: usize = 1_000_000;
 const BATCH_SIZE: usize = 410;
-const NUM_ITERS: usize = 10;
 const SEED: u64 = 42;
 
 // ═══════════════════════════════════════════════════════════════════
 // Data generation (matching C++ GenData exactly)
-// Uses rand_mt::Mt19937GenRand64 for RNG compatibility
 // ═══════════════════════════════════════════════════════════════════
 
 use rand_mt::Mt19937GenRand64;
@@ -33,11 +35,6 @@ use rand_mt::Mt19937GenRand64;
 #[inline]
 fn hash_bytes(data: &[u8], seed: u64) -> u64 {
     xxh3_64_with_seed(data, seed)
-}
-
-#[inline]
-fn hash_combine(seed: u64, val: i64) -> u64 {
-    xxh3_64_with_seed(&val.to_le_bytes(), seed)
 }
 
 fn gen_string(base: &str, id: usize, col: usize) -> Vec<u8> {
@@ -60,7 +57,6 @@ fn gen_data(num_keys: usize, sel: f64) -> BenchData {
         .map(|c| (0..num_keys).map(|i| gen_string("key", i, c)).collect())
         .collect();
 
-    // Build hashes
     let build_hashes: Vec<u64> = (0..num_keys)
         .map(|i| {
             let mut h = 0u64;
@@ -166,13 +162,32 @@ fn run_workload(data: &BenchData, num_chunks: usize) -> usize {
 // ═══════════════════════════════════════════════════════════════════
 
 fn main() {
-    let sel: f64 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.1);
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut sel: f64 = 0.1;
+    let mut num_iters: usize = 10;
+    let mut profile_wait = false;
+
+    let mut positional = 0;
+    for arg in args.iter().skip(1) {
+        if arg == "--profile-wait" {
+            profile_wait = true;
+        } else {
+            match positional {
+                0 => sel = arg.parse().unwrap_or(0.1),
+                1 => num_iters = arg.parse().unwrap_or(10),
+                _ => {}
+            }
+            positional += 1;
+        }
+    }
 
     if sel <= 0.0 || sel > 1.0 {
         eprintln!("sel must be in (0,1]");
+        std::process::exit(1);
+    }
+    if num_iters == 0 {
+        eprintln!("iterations must be > 0");
         std::process::exit(1);
     }
 
@@ -186,34 +201,51 @@ fn main() {
     eprintln!("Config: 4str_0int, ht={}, lf={:.2}, sel={:.1}", HT_SIZE, LOAD_FACTOR, sel);
     eprintln!("numKeys={}, numProbe={}, totalRows={}", num_keys, NUM_PROBE_ROWS, num_keys + NUM_PROBE_ROWS);
     eprintln!("distinctKeys={}, numChunks={}, capacity={}", distinct_keys, num_chunks, num_chunks * 8);
-    eprintln!("Iterations: {} (+ 1 warmup)", NUM_ITERS);
+    eprintln!("Iterations: {} (+ 1 warmup)", num_iters);
+
+    // Data generation (timed separately)
     eprintln!("Generating data...");
-
+    let t_gen0 = Instant::now();
     let data = gen_data(num_keys, sel);
-    eprintln!("Data generated. totalRows={}\n", data.total_rows);
+    let t_gen1 = Instant::now();
+    let gen_ms = t_gen1.duration_since(t_gen0).as_secs_f64() * 1000.0;
+    eprintln!("Data generated. totalRows={} ({:.1} ms)\n", data.total_rows, gen_ms);
 
-    // Warmup
+    // Warmup (timed separately)
     eprintln!("Warmup...");
+    let t_warm0 = Instant::now();
     let warmup_groups = run_workload(&data, num_chunks);
-    eprintln!("Warmup done (groups={})\n", warmup_groups);
+    let t_warm1 = Instant::now();
+    let warm_ms = t_warm1.duration_since(t_warm0).as_secs_f64() * 1000.0;
+    eprintln!("Warmup done (groups={}, {:.1} ms)\n", warmup_groups, warm_ms);
+
+    // Profile-wait mode
+    if profile_wait {
+        eprintln!("READY pid={}", std::process::id());
+        eprintln!("Attach perf then press Enter to start measured iterations...");
+        let stdin = io::stdin();
+        let _ = stdin.lock().lines().next();
+    }
 
     // Timed iterations
-    eprintln!("Running {} iterations...", NUM_ITERS);
+    eprintln!("Running {} iterations...", num_iters);
     let t0 = Instant::now();
 
     let mut groups = 0usize;
-    for _ in 0..NUM_ITERS {
+    for _ in 0..num_iters {
         groups = run_workload(&data, num_chunks);
     }
 
-    let elapsed = t0.elapsed();
-    let elapsed_ns = elapsed.as_nanos() as f64;
-    let per_iter_ns = elapsed_ns / NUM_ITERS as f64;
-    let per_iter_ms = per_iter_ns / 1e6;
+    let t1 = Instant::now();
+    let total_ms = t1.duration_since(t0).as_secs_f64() * 1000.0;
+    let per_iter_ms = total_ms / num_iters as f64;
+    let per_iter_ns = per_iter_ms * 1e6;
     let items_per_sec = data.total_rows as f64 / (per_iter_ns / 1e9);
 
     println!("=== Results ===");
-    println!("Total elapsed:     {:.3} ms", elapsed_ns / 1e6);
+    println!("Setup time:        {:.3} ms", gen_ms);
+    println!("Warmup time:       {:.3} ms", warm_ms);
+    println!("Workload total:    {:.3} ms", total_ms);
     println!("Per iteration:     {:.3} ms", per_iter_ms);
     println!("ns/iteration:      {:.0}", per_iter_ns);
     println!("Items/sec:         {:.3} M/s", items_per_sec / 1e6);
