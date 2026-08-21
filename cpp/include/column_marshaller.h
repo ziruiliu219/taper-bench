@@ -125,7 +125,7 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
     const uint8_t* stored = rowData+1+rowLenSize;
-    return InlineMemEqual(stored, input, stringLen);
+    return memcmp(stored, input, stringLen) == 0;
 }
 
 // ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────
