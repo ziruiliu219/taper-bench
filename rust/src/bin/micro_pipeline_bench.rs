@@ -102,6 +102,62 @@ fn run_hashmap_plus_newrow(data: &BenchData, num_chunks: usize) -> usize {
     table.len() + sum as usize
 }
 
+// ─── Case C2: hashmap + NewRow + serialize (no batch compare) ─────────────
+#[inline(never)]
+fn run_hashmap_plus_serialize(data: &BenchData, num_chunks: usize) -> usize {
+    use taper_hashmap::column_marshaller::{serialize_varchar_to_buffer, compute_row_len_size};
+
+    let key_sizes = vec![0usize; 4];
+    let kinds = vec![ColumnKind::Varchar; 4];
+    let mut rc = RowContainer::with_kinds(&key_sizes, &kinds, 8);
+    let mut table = TaperHashMap::with_capacity(num_chunks);
+    let agg_offset = rc.agg_state_offset();
+    let mut sum: u64 = 0;
+
+    let total_rows = data.hashes.len();
+    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    for batch_idx in 0..num_batches {
+        let start = batch_idx * BATCH_SIZE;
+        let end = (start + BATCH_SIZE).min(total_rows);
+        let batch_hashes = &data.hashes[start..end];
+
+        let str_slices: Vec<Vec<&[u8]>> = (0..NUM_STR_COLS)
+            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
+            .collect();
+
+        let rc_ptr = &mut rc as *mut RowContainer;
+
+        table.emplace_batch_full(
+            batch_hashes,
+            &|_: usize, _: &SlotValue| -> bool { true },
+            &mut |i: usize, sv: &mut SlotValue| {
+                let rc = unsafe { &mut *rc_ptr };
+                let row = rc.new_row();
+                // Serialize 4 varchars into merged block
+                let mut total_size = 0usize;
+                for c in 0..NUM_STR_COLS {
+                    let s = str_slices[c][i];
+                    total_size += 1 + compute_row_len_size(s.len()) as usize + s.len();
+                }
+                let block = rc.arena_alloc(total_size);
+                let mut wp = block;
+                for c in 0..NUM_STR_COLS {
+                    let s = str_slices[c][i];
+                    let written = unsafe { serialize_varchar_to_buffer(wp, s) };
+                    wp = unsafe { wp.add(written) };
+                }
+                // Store pointer at offset 0
+                unsafe { (row as *mut *const u8).write_unaligned(block as *const u8); }
+                RowContainer::store_value::<i64>(row, agg_offset, data.values[start + i]);
+                sv.set_ptr(row as *const u8);
+            },
+            &mut |_i: usize, _sv: &SlotValue, is_new: bool| { if !is_new { sum += 1; } },
+        );
+    }
+    table.len() + sum as usize
+}
+
 // ─── Case D: full pipeline ───────────────────────────────────────────────
 #[inline(never)]
 fn run_full_pipeline(data: &BenchData, num_chunks: usize) -> usize {
@@ -154,5 +210,6 @@ fn main() {
     println!("=== Results (sel={:.1}, {} iters) ===", sel, num_iters);
     bench("A: hashmap_only", run_hashmap_only);
     bench("C: hashmap+newrow", run_hashmap_plus_newrow);
+    bench("C2: hashmap+newrow+serialize", run_hashmap_plus_serialize);
     bench("D: full_pipeline", run_full_pipeline);
 }

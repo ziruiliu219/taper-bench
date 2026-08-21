@@ -88,6 +88,58 @@ static BenchData GenData(size_t nKeys, double sel) {
     return d;
 }
 
+// ─── Case C2: HashMap + NewRow + StoreKeyOneRow (serialize, no batch compare) ─
+__attribute__((noinline))
+static size_t RunHashmapPlusSerialize(const BenchData& d, size_t numChunks) {
+    taper::SimpleArenaAllocator pool;
+    std::vector<size_t> keySizes(4, 0);
+    std::vector<taper::ColumnKind> kinds(4, taper::ColumnKind::Varchar);
+    taper::RowContainer rc(keySizes, kinds, 8, pool);
+    taper::TaperFlatHashTable table(numChunks);
+    int32_t aggOffset = rc.AggStateOffset();
+    uint64_t sum = 0;
+
+    // Process in batches (same as real pipeline)
+    size_t numBatches = (d.totalRows + BATCH_SIZE - 1) / BATCH_SIZE;
+    std::vector<taper::ColumnInput> cols(NUM_STR_COLS);
+
+    for (size_t batch = 0; batch < numBatches; batch++) {
+        size_t start = batch * BATCH_SIZE;
+        size_t end = std::min(start + BATCH_SIZE, d.totalRows);
+        int32_t batchLen = static_cast<int32_t>(end - start);
+
+        for (size_t c = 0; c < NUM_STR_COLS; c++)
+            cols[c] = taper::ColumnInput::MakeVarchar(d.strSlices[c].data() + start);
+
+        const taper::ColumnInput* colsPtr = cols.data();
+        taper::RowContainer* rcPtr = &rc;
+
+        table.EmplaceBatch(d.hashes.data() + start, batchLen,
+            [](int32_t) { return false; },
+            [&](uint32_t rowIdx, char* data) {
+                char* row = rcPtr->NewRow();
+                // SetRowPtr
+                uint64_t ptr = reinterpret_cast<uint64_t>(row);
+                memcpy(data, &ptr, taper::ROW_PTR_SIZE);
+                // StoreKeyOneRow — serialize 4 varchars into merged block
+                size_t totalSize = 0;
+                for (size_t c = 0; c < NUM_STR_COLS; c++) {
+                    totalSize += 1 + taper::ComputeRowLenSize(colsPtr[c].vcSlices[rowIdx].len) + colsPtr[c].vcSlices[rowIdx].len;
+                }
+                uint8_t* block = rcPtr->ArenaAlloc(totalSize);
+                uint8_t* wp = block;
+                for (size_t c = 0; c < NUM_STR_COLS; c++) {
+                    wp += taper::SerializeVarcharToBuffer(wp, colsPtr[c].vcSlices[rowIdx].ptr, colsPtr[c].vcSlices[rowIdx].len);
+                }
+                memcpy(row, &block, sizeof(block)); // store pointer at offset 0 (varchar slot col)
+                taper::RowContainer::StoreValue<int64_t>(row, aggOffset, d.values[start + rowIdx]);
+            },
+            [&sum](uint32_t, char*, bool isNew) { if (!isNew) sum++; }
+        );
+    }
+    return table.Size() + sum;
+}
+
 // ─── Case D: Full pipeline (same as profile_taper_standalone) ─────────────
 __attribute__((noinline))
 static size_t RunFullPipeline(const BenchData& d, size_t numChunks) {
@@ -178,6 +230,7 @@ int main(int argc, char** argv) {
     printf("=== Results (sel=%.1f, %zu iters) ===\n", sel, numIters);
     bench("A: hashmap_only", RunHashmapOnly);
     bench("C: hashmap+newrow", RunHashmapPlusNewRow);
+    bench("C2: hashmap+newrow+serialize", RunHashmapPlusSerialize);
     bench("D: full_pipeline", RunFullPipeline);
 
     return 0;
