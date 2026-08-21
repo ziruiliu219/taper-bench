@@ -102,12 +102,71 @@ static TAPER_FORCE_INLINE bool InlineMemEqual(const uint8_t* a, const uint8_t* b
     return memcmp(a, b, len) == 0;
 }
 
+/// Inline short memory copy for 0–32 bytes.
+/// Uses fixed-width memcpy (compiled to unaligned store instructions, no function call)
+/// to avoid the overhead of calling libc memcpy for short buffers on Kunpeng 920.
+///
+/// Same overlap strategy as InlineMemEqual:
+/// - 8–16 bytes: copy first 8 + last 8 (overlap harmless for copy)
+/// - 4–7 bytes: copy first 4 + last 4
+/// - 1–3 bytes: byte-by-byte
+/// - 17–32 bytes: copy first 16 + last 16
+/// - 0 bytes: no-op
+/// - >32 bytes: falls back to memcpy
+static TAPER_FORCE_INLINE void InlineMemCopy(uint8_t* dst, const uint8_t* src, size_t len) {
+    if (len == 0) return;
+
+    if (len >= 8 && len <= 16) {
+        uint64_t v0, v1;
+        memcpy(&v0, src, 8);
+        memcpy(&v1, src + len - 8, 8);
+        memcpy(dst, &v0, 8);
+        memcpy(dst + len - 8, &v1, 8);
+        return;
+    }
+
+    if (len >= 4 && len < 8) {
+        uint32_t v0, v1;
+        memcpy(&v0, src, 4);
+        memcpy(&v1, src + len - 4, 4);
+        memcpy(dst, &v0, 4);
+        memcpy(dst + len - 4, &v1, 4);
+        return;
+    }
+
+    if (len < 4) {
+        dst[0] = src[0];
+        if (len > 1) dst[len - 1] = src[len - 1];
+        if (len > 2) dst[1] = src[1];
+        return;
+    }
+
+    if (len <= 32) {
+        uint64_t v0, v1, v2, v3;
+        memcpy(&v0, src, 8);
+        memcpy(&v1, src + 8, 8);
+        memcpy(&v2, src + len - 16, 8);
+        memcpy(&v3, src + len - 8, 8);
+        memcpy(dst, &v0, 8);
+        memcpy(dst + 8, &v1, 8);
+        memcpy(dst + len - 16, &v2, 8);
+        memcpy(dst + len - 8, &v3, 8);
+        return;
+    }
+
+    memcpy(dst, src, len);
+}
+
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
 inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, size_t len) {
     uint8_t rowLenSize = ComputeRowLenSize(len); *writePos = rowLenSize;
-    uint32_t l32 = static_cast<uint32_t>(len); memcpy(writePos+1, &l32, rowLenSize);
-    if (len) memcpy(writePos+1+rowLenSize, data, len);
+    uint32_t l32 = static_cast<uint32_t>(len);
+    // Write length (1-4 bytes) — always small, use memcpy directly
+    memcpy(writePos+1, &l32, rowLenSize);
+    // Write string data — use inline copy for short strings
+    if (len) InlineMemCopy(writePos+1+rowLenSize, data, len);
+
     return 1+rowLenSize+len;
 }
 
