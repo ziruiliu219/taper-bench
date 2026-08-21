@@ -132,7 +132,7 @@ int main(int argc,char**argv){
     for(size_t i=0;i<cfgs.size();i++){
         auto&c=cfgs[i];
         std::string name=std::string("taper/")+c.n+"/ht="+std::to_string(c.ht)+"/lf="+std::to_string(c.lf).substr(0,4)+"/sel="+std::to_string(c.sel).substr(0,3);
-        benchmark::RegisterBenchmark(name.c_str(),BM_Taper)->Arg(i)->Iterations(1);
+        benchmark::RegisterBenchmark(name.c_str(),BM_Taper)->Arg(i)->Iterations(10);
     }
     benchmark::Initialize(&argc,argv);
     benchmark::RunSpecifiedBenchmarks();
