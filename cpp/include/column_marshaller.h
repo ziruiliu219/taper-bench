@@ -33,6 +33,75 @@ struct ColumnInput {
 
 // ─── Varchar helpers ─────────────────────────────────────────────────────────
 
+// Force-inline macro: GCC/Clang use __attribute__((always_inline)), MSVC uses __forceinline.
+#if defined(__GNUC__) || defined(__clang__)
+#define TAPER_FORCE_INLINE inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define TAPER_FORCE_INLINE __forceinline
+#else
+#define TAPER_FORCE_INLINE inline
+#endif
+
+/// Inline byte-sequence equality for short strings (0–32 bytes).
+/// Uses fixed-width memcpy (compiled to unaligned load instructions, no function call)
+/// to avoid the overhead of calling libc memcmp/bcmp for short buffers.
+///
+/// For 8–16 bytes: compare first 8 and last 8 bytes (overlap is harmless).
+/// For 4–7 bytes: compare first 4 and last 4 bytes.
+/// For 1–3 bytes: compare first, middle, and last byte.
+/// For 17–32 bytes: compare first 16 and last 16 bytes.
+/// For 0 bytes: always equal.
+/// For >32 bytes: falls back to memcmp.
+///
+/// All reads use memcpy to avoid alignment and strict-aliasing issues.
+/// Safe on x86-64, AArch64, and Apple Silicon.
+static TAPER_FORCE_INLINE bool InlineMemEqual(const uint8_t* a, const uint8_t* b, size_t len) {
+    if (len == 0) return true;
+
+    if (len >= 8 && len <= 16) {
+        uint64_t a0, b0, a1, b1;
+        memcpy(&a0, a, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&a1, a + len - 8, 8);
+        memcpy(&b1, b + len - 8, 8);
+        return (a0 == b0) & (a1 == b1);
+    }
+
+    if (len >= 4 && len < 8) {
+        uint32_t a0, b0, a1, b1;
+        memcpy(&a0, a, 4);
+        memcpy(&b0, b, 4);
+        memcpy(&a1, a + len - 4, 4);
+        memcpy(&b1, b + len - 4, 4);
+        return (a0 == b0) & (a1 == b1);
+    }
+
+    if (len < 4) {
+        // 1–3 bytes: compare first, middle, last
+        // For len=1: first==last, mid index is 0 (harmless repeat)
+        // For len=2: first, mid=len/2=1, last=1 (covers both bytes)
+        // For len=3: first=0, mid=1, last=2
+        return (a[0] == b[0]) & (a[len >> 1] == b[len >> 1]) & (a[len - 1] == b[len - 1]);
+    }
+
+    if (len <= 32) {
+        // 17–32 bytes: compare first 16 and last 16
+        uint64_t a0, b0, a1, b1, a2, b2, a3, b3;
+        memcpy(&a0, a, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&a1, a + 8, 8);
+        memcpy(&b1, b + 8, 8);
+        memcpy(&a2, a + len - 16, 8);
+        memcpy(&b2, b + len - 16, 8);
+        memcpy(&a3, a + len - 8, 8);
+        memcpy(&b3, b + len - 8, 8);
+        return (a0 == b0) & (a1 == b1) & (a2 == b2) & (a3 == b3);
+    }
+
+    // >32 bytes: fall back to memcmp
+    return memcmp(a, b, len) == 0;
+}
+
 inline uint8_t ComputeRowLenSize(size_t len) { return len<=0xFF?1:len<=0xFFFF?2:4; }
 
 inline size_t SerializeVarcharToBuffer(uint8_t* writePos, const uint8_t* data, size_t len) {
@@ -56,7 +125,7 @@ inline bool CompareVarcharFromRow(const uint8_t* rowData, const uint8_t* input, 
     if (stringLen!=inputLen) return false;
     if (stringLen==0) return true;
     const uint8_t* stored = rowData+1+rowLenSize;
-    return memcmp(stored, input, stringLen) == 0;
+    return InlineMemEqual(stored, input, stringLen);
 }
 
 // ─── SetRowPtr / GetRowPtr ────────────────────────────────────────────────────

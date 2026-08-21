@@ -45,3 +45,6 @@ target_include_directories(profile_taper_4str PRIVATE include ${xxhash_SOURCE_DI
 
 add_executable(verify src/verify.cpp)
 target_include_directories(verify PRIVATE include ${xxhash_SOURCE_DIR})
+
+add_executable(test_inline_mem_equal src/test_inline_mem_equal.cpp)
+target_include_directories(test_inline_mem_equal PRIVATE include ${xxhash_SOURCE_DIR})
