@@ -92,5 +92,5 @@ fn main() {
         table.emplace_table_with_decode(batch_hashes, &columns, batch_values);
     }
 
-    println!("Rust: NumGroups = {}", table.num_groups());
+    println!("Rust: NumGroups = {}, AggChecksum = {}", table.num_groups(), table.agg_checksum());
 }

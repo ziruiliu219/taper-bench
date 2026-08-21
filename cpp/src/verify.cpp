@@ -100,5 +100,5 @@ int main() {
         t.EmplaceTableWithDecode(allHashes.data() + start, batchLen, cols, allValues.data() + start);
     }
 
-    printf("C++:  NumGroups = %zu\n", t.NumGroups());
+    printf("C++:  NumGroups = %zu, AggChecksum = %lld\n", t.NumGroups(), (long long)t.AggChecksum());
 }
