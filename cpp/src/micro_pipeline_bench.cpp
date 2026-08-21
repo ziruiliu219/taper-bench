@@ -89,7 +89,7 @@ static BenchData GenData(size_t nKeys, double sel) {
 }
 
 // ─── Case C2: HashMap + NewRow + StoreKeyOneRow (serialize, no batch compare) ─
-__attribute__((noinline))
+__attribute__((noinline, flatten))
 static size_t RunHashmapPlusSerialize(const BenchData& d, size_t numChunks) {
     taper::SimpleArenaAllocator pool;
     std::vector<size_t> keySizes(4, 0);
