@@ -60,7 +60,7 @@ fn run_serialize_4str_only(str_cols: &[Vec<Vec<u8>>]) -> u64 {
         let mut wp = block;
         for c in 0..4 {
             let s = &str_cols[c][i];
-            let written = unsafe { serialize_varchar_to_buffer(wp, s.as_slice()) };
+            let written = serialize_varchar_to_buffer(wp, s.as_slice());
             wp = unsafe { wp.add(written) };
         }
         checksum = checksum.wrapping_add(block as u64);
@@ -81,7 +81,7 @@ fn run_compare_4str_only(arena_blocks: &[*const u8], str_cols: &[Vec<Vec<u8>>]) 
                 all_match = false;
                 break;
             }
-            let entry_size = unsafe { compute_varchar_serialized_size(pos) };
+            let entry_size = compute_varchar_serialized_size(pos);
             pos = unsafe { pos.add(entry_size) };
         }
         if all_match { match_count += 1; }
@@ -135,29 +135,27 @@ fn main() {
         })
         .collect();
 
-    // Pre-serialize for compare bench
-    let arena_blocks: Vec<*const u8> = {
-        let key_sizes = vec![0usize; 4];
-        let kinds = vec![ColumnKind::Varchar; 4];
-        let mut rc = RowContainer::with_kinds(&key_sizes, &kinds, 8);
-        (0..NUM_OPS)
-            .map(|i| {
-                let mut total_size = 0usize;
-                for c in 0..4 {
-                    let s = &str_cols[c][i];
-                    total_size += 1 + compute_row_len_size(s.len()) as usize + s.len();
-                }
-                let block = rc.arena_alloc(total_size);
-                let mut wp = block;
-                for c in 0..4 {
-                    let s = &str_cols[c][i];
-                    let written = unsafe { serialize_varchar_to_buffer(wp, s.as_slice()) };
-                    wp = unsafe { wp.add(written) };
-                }
-                block as *const u8
-            })
-            .collect()
-    };
+    // Pre-serialize for compare bench — rc must live as long as arena_blocks
+    let key_sizes_cmp = vec![0usize; 4];
+    let kinds_cmp = vec![ColumnKind::Varchar; 4];
+    let mut rc_for_compare = RowContainer::with_kinds(&key_sizes_cmp, &kinds_cmp, 8);
+    let arena_blocks: Vec<*const u8> = (0..NUM_OPS)
+        .map(|i| {
+            let mut total_size = 0usize;
+            for c in 0..4 {
+                let s = &str_cols[c][i];
+                total_size += 1 + compute_row_len_size(s.len()) as usize + s.len();
+            }
+            let block = rc_for_compare.arena_alloc(total_size);
+            let mut wp = block;
+            for c in 0..4 {
+                let s = &str_cols[c][i];
+                let written = serialize_varchar_to_buffer(wp, s.as_slice());
+                wp = unsafe { wp.add(written) };
+            }
+            block as *const u8
+        })
+        .collect();
 
     // Hashes for probe bench
     use rand_mt::Mt19937GenRand64;
