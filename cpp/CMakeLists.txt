@@ -48,3 +48,11 @@ target_include_directories(verify PRIVATE include ${xxhash_SOURCE_DIR})
 
 add_executable(test_inline_mem_equal src/test_inline_mem_equal.cpp)
 target_include_directories(test_inline_mem_equal PRIVATE include ${xxhash_SOURCE_DIR})
+
+add_executable(cpp_profile_taper src/profile_taper_standalone.cpp)
+target_include_directories(cpp_profile_taper PRIVATE include ${xxhash_SOURCE_DIR})
+# Optional instrumentation: cmake -DPROFILE_INSTRUMENTATION=ON
+option(PROFILE_INSTRUMENTATION "Enable compile-time profile counters" OFF)
+if(PROFILE_INSTRUMENTATION)
+    target_compile_definitions(cpp_profile_taper PRIVATE PROFILE_INSTRUMENTATION)
+endif()
