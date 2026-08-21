@@ -318,7 +318,7 @@ private:
 
     // ─── Hot path: store keys for one row ───
 
-    void StoreKeyOneRow(char* row, int32_t rowIdx, const ColumnInput* cols) {
+    TAPER_FORCE_INLINE void StoreKeyOneRow(char* row, int32_t rowIdx, const ColumnInput* cols) {
         if (useMerged_) {
             size_t totalSize = 0;
             for (int32_t v = 0; v < static_cast<int32_t>(varcharColIndices_.size()); v++) {
